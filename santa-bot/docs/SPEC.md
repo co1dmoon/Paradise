@@ -735,3 +735,12 @@ Simulator: tools/simulate.py runs scenario 3 with 12 named Russian users on Fake
 - A Telegram adapter for CIS users (Stars payments, hosted abroad).
 - A web fallback for participants without MAX.
 - A MAX mini-app UI for wishes.
+## Implementation notes
+Deliberate deviations and decisions made while building (foundation stage):
+- Data model: `participants.via` also allows `organizer` (the organizer's own row). `payments.game_id` is nullable with ON DELETE SET NULL, so amounts survive the 180-day game purge. `outbox` has two extra columns, `purpose` and `game_id`, so delivery hooks can track draw results (`result_dm_ok`) and send the 'Пары отправлены' summary exactly once.
+- MAX API (checked on dev.max.ru 2026-09-24): PUT /messages, POST /answers and POST /subscriptions answer HTTP 200 with `{success:false, message}` on failure; this is treated as an error and classified by the message text. HTTP 403 is always Forbidden. `notification` in /answers is undocumented: on BadRequest the bot answers without it, stops sending it, and the outbox sends the text as a normal message.
+- Rate limits: the global bucket is 25/s with a burst of 1 (evenly spaced). Callback answers use their own 1/s lane per dialog, so a dialog gets at most one send/edit plus one answer per second (MAX allows 2/s).
+- Retries: HTTP 401 is retried with the same backoff as 429/5xx (a token being fixed should not kill queued messages) and logged as an error.
+- Config: extra optional variables `DATA_DIR` (default /data) and `PORT` (default 8080). Generated secrets are stored in `DATA_DIR/secrets.env` (mode 0600) and printed once; a value in .env wins. Owner fields (OWNER_*, SUPPORT_EMAIL) are required only when the bot or payments are enabled; otherwise they are warnings.
+- Leaving or being removed before the draw deletes that person's exclusions and moves the first waiting person into the game. A removed participant cannot rejoin the same game.
+- /stats periods are Moscow calendar days: today, the last 7 days including today, and the season since September 1.
