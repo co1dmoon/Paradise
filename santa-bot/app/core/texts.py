@@ -842,6 +842,21 @@ def bad_signature_alert(inv_id: str) -> str:
     return f"Robokassa прислала уведомление с неверной подписью (InvId {inv_id}). Проверьте пароли в .env."
 
 
+def unknown_invoice_alert(inv_id: int) -> str:
+    return (
+        f"Robokassa подтвердила оплату InvId {inv_id}, но такого платежа нет в базе "
+        "(например, база восстановлена из старой копии). Найдите платёж в кабинете Robokassa "
+        "и выдайте тариф командой /grant или верните деньги."
+    )
+
+
+def amount_mismatch_alert(*, inv_id: int, received: str, expected: int) -> str:
+    return (
+        f"Robokassa прислала оплату InvId {inv_id} на сумму {received}, а ожидалось {expected} ₽. "
+        "Тариф не выдан — проверьте платёж в кабинете Robokassa."
+    )
+
+
 def message_rejected(*, target: str, error: str) -> str:
     return f"MAX отклонил сообщение для {target}: {error}"
 

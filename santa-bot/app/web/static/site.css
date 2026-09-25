@@ -1,0 +1,224 @@
+/* «Санта в чате»: one small mobile-first stylesheet, system fonts, no external resources. */
+
+:root {
+  --bg: #fffaf5;
+  --surface: #ffffff;
+  --text: #1f2328;
+  --muted: #5f6670;
+  --accent: #c62828;
+  --accent-text: #ffffff;
+  --green: #1b5e20;
+  --line: #eadfd6;
+  --bubble: #eef6ee;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15171a;
+    --surface: #1e2125;
+    --text: #eceff1;
+    --muted: #a7adb4;
+    --accent: #ef5350;
+    --accent-text: #15171a;
+    --green: #81c784;
+    --line: #2f3338;
+    --bubble: #22302a;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 17px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+
+a {
+  color: var(--accent);
+}
+
+.top,
+.page,
+.foot {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 0 16px;
+}
+
+.top {
+  padding-top: 16px;
+  padding-bottom: 8px;
+}
+
+.brand {
+  color: var(--text);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.brand-mark {
+  color: var(--accent);
+}
+
+h1 {
+  font-size: 1.75rem;
+  line-height: 1.25;
+  margin: 24px 0 12px;
+}
+
+h2 {
+  font-size: 1.3rem;
+  margin: 36px 0 12px;
+}
+
+h3 {
+  font-size: 1.05rem;
+  margin: 0 0 4px;
+}
+
+.lead {
+  font-size: 1.1rem;
+  color: var(--muted);
+}
+
+.note {
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.button {
+  display: inline-block;
+  margin: 12px 0;
+  padding: 14px 28px;
+  border-radius: 12px;
+  background: var(--accent);
+  color: var(--accent-text);
+  font-size: 1.1rem;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.button:focus-visible,
+a:focus-visible,
+summary:focus-visible {
+  outline: 3px solid var(--green);
+  outline-offset: 2px;
+}
+
+.counter {
+  color: var(--green);
+  font-weight: 600;
+}
+
+.steps {
+  padding-left: 1.4em;
+}
+
+.steps li {
+  margin-bottom: 16px;
+}
+
+.chat {
+  max-width: 440px;
+  padding: 16px;
+  border-radius: 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+}
+
+.bubble {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: 14px 14px 14px 4px;
+  background: var(--bubble);
+  white-space: pre-line;
+}
+
+.chat-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.chat-buttons span {
+  flex: 1 1 160px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  text-align: center;
+  font-size: 0.9rem;
+  color: var(--accent);
+}
+
+.prices {
+  border-collapse: collapse;
+  margin: 8px 0 12px;
+}
+
+.prices td {
+  padding: 8px 16px 8px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.prices td:last-child {
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+details {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+details p {
+  margin: 8px 0 0;
+}
+
+.cta {
+  margin: 32px 0;
+  text-align: center;
+}
+
+.doc h2 {
+  font-size: 1.15rem;
+  margin-top: 28px;
+}
+
+.doc ul {
+  padding-left: 1.2em;
+}
+
+.foot {
+  margin-top: 48px;
+  padding-top: 16px;
+  padding-bottom: 32px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.foot-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+
+@media (min-width: 720px) {
+  h1 {
+    font-size: 2.3rem;
+  }
+}

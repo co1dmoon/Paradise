@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Контакты{% endblock %}
+{% block content %}
+<article class="doc">
+<h1>Контакты</h1>
+<p>
+  {{ seller.full_name }}<br>
+  Самозанятый (плательщик налога на профессиональный доход)<br>
+  ИНН {{ seller.inn }}<br>
+  Электронная почта: {% if seller.has_email %}<a href="mailto:{{ seller.email }}">{{ seller.email }}</a>{% else %}{{ seller.email }}{% endif %}
+</p>
+<p>Отвечаем на письма в течение 1–2 рабочих дней. Вопросы об оплате и возврате денег, просьбы удалить данные и жалобы присылайте на эту почту. Пожаловаться на анонимное сообщение можно и прямо в боте — кнопкой «Пожаловаться» под сообщением.</p>
+{% if bot_url %}
+<p><a class="button" href="{{ bot_url }}">Открыть бота в MAX</a></p>
+{% endif %}
+</article>
+{% endblock %}

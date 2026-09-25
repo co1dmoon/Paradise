@@ -151,6 +151,16 @@ async def collect_stats(db: Db, start: datetime, end: datetime) -> StatsBlock:
     )
 
 
+async def total_draws(db: Db) -> int:
+    """Draws ever held, redraws not counted: the landing counter (§8)."""
+    return int(
+        await db.fetchval(
+            "SELECT COUNT(*) FROM events"
+            " WHERE type = 'draw_done' AND NOT COALESCE(json_extract(props, '$.redraw'), 0)"
+        )
+    )
+
+
 async def open_reports(db: Db) -> int:
     return int(await db.fetchval("SELECT COUNT(*) FROM reports WHERE resolved = 0"))
 
