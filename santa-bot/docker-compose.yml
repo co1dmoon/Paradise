@@ -1,0 +1,54 @@
+# «Санта в чате» on one VPS (§13): the bot and website (app) behind Caddy (HTTPS).
+# Start or update: docker compose up -d --build. Settings live in .env (see .env.example).
+name: santa-bot
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  app:
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    image: santa-bot:latest
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data
+    # Reachable only from the server itself (for `curl http://127.0.0.1:8080/healthz`);
+    # the outside world goes through Caddy.
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    stop_grace_period: 30s
+    logging: *logging
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - app
+    environment:
+      DOMAIN: ${DOMAIN:?Заполните DOMAIN в файле .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging: *logging
+
+volumes:
+  caddy_data:
+  caddy_config:

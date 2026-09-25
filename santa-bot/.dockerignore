@@ -1,0 +1,21 @@
+# Keep secrets, data and development files out of the image.
+.env*
+data/
+*.db
+*.db-wal
+*.db-shm
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml
+Caddyfile
+tests/
+docs/
+README_RU.md
+requirements-dev.txt
+pytest.ini

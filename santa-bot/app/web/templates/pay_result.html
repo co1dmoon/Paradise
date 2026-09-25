@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}{% if success %}Оплата получена{% else %}Оплата не прошла{% endif %}{% endblock %}
+{% block meta %}<meta name="robots" content="noindex">{% endblock %}
+{% block content %}
+<section class="hero">
+  {% if success %}
+  <h1>Спасибо! Оплата получена — вернитесь в MAX</h1>
+  <p class="lead">Игра расширится сама в течение пары минут, а бот пришлёт сообщение.</p>
+  {% else %}
+  <h1>Оплата не прошла — попробуйте ещё раз</h1>
+  <p class="lead">Вернитесь в бот и нажмите кнопку оплаты снова. Если страница оплаты не открывается — включите Wi-Fi или попробуйте чуть позже.</p>
+  {% endif %}
+  {% if return_url %}
+  <a class="button" href="{{ return_url }}">Вернуться в MAX</a>
+  {% endif %}
+  {% if seller.has_email %}
+  <p class="note">
+    {% if success %}Бот не написал в течение 15 минут?{% else %}Деньги списались, а игра не расширилась?{% endif %}
+    Напишите на <a href="mailto:{{ seller.email }}">{{ seller.email }}</a>{% if inv_id %} и укажите номер платежа {{ inv_id }}{% endif %}.
+  </p>
+  {% endif %}
+</section>
+{% endblock %}

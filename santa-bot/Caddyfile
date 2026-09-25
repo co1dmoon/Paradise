@@ -1,0 +1,7 @@
+# HTTPS in front of the app (§13). Caddy gets and renews a Let's Encrypt certificate for
+# DOMAIN by itself; MAX accepts only webhooks with a certificate from a trusted CA.
+# DOMAIN comes from .env through docker-compose.yml.
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy app:8080
+}

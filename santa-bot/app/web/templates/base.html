@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}{% endblock %} — Санта в чате</title>
+<meta name="description" content="Бот «Санта в чате» проводит Тайного Санту прямо в мессенджере MAX: приглашение по ссылке, пожелания к подарку, жеребьёвка пар и анонимные вопросы.">
+{% block meta %}{% endblock %}
+<link rel="stylesheet" href="/static/site.css">
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+{% block scripts %}{% endblock %}
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="/"><span class="brand-mark" aria-hidden="true">★</span> Санта в чате</a>
+</header>
+<main class="page">
+{% block content %}{% endblock %}
+</main>
+<footer class="foot">
+  <p>
+    Продавец: {{ seller.full_name }}, самозанятый (плательщик налога на профессиональный доход),
+    ИНН {{ seller.inn }}.
+    Почта: {% if seller.has_email %}<a href="mailto:{{ seller.email }}">{{ seller.email }}</a>{% else %}{{ seller.email }}{% endif %}.
+  </p>
+  <nav class="foot-links" aria-label="Документы">
+    <a href="/offer">Оферта</a>
+    <a href="/privacy">Политика обработки данных</a>
+    <a href="/consent">Согласие на обработку данных</a>
+    <a href="/terms">Правила</a>
+    <a href="/contacts">Контакты</a>
+  </nav>
+</footer>
+</body>
+</html>
