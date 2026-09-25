@@ -980,6 +980,9 @@ ADMIN_HELP = (
     "/clean КОД USERID — стереть пожелания, имя и сообщения человека в игре\n"
     "/forget USERID — удалить все данные человека по его просьбе\n"
     "/maintenance on|off — технические работы\n"
+    "/ads — реклама: сводка и управление (все команды: /ads help)\n"
+    "/link СЛОВО [название] — ссылка для ручного продвижения; /links — что принесли ссылки\n"
+    "/channel — посты в ваш канал MAX\n"
     "/whoami — ваш id"
 )
 
@@ -1058,3 +1061,464 @@ def amount_mismatch_alert(*, inv_id: int, received: str, expected: int) -> str:
 def message_rejected(*, target: str, error: str) -> str:
     return f"MAX отклонил сообщение для {target}: {error}"
 
+
+
+# --- PROMO_SPEC: the ad autopilot, tracking links and the own MAX channel (admins only) -------------------
+# Keys are the stored values: platforms 'yd'/'vk', states, 'paused_by' causes, budget periods.
+
+PROMO_DISABLED = (
+    "Автопилот рекламы выключен. Чтобы включить, поставьте PROMO_ENABLED=1 в .env и выполните "
+    "docker compose up -d. Инструкция — docs/PROMO_KIT_RU.md."
+)
+_PROMO_PLATFORMS = {"yd": "Яндекс", "vk": "VK"}
+_PROMO_PLATFORMS_FULL = {"yd": "Яндекс Директ", "vk": "VK Реклама"}
+_PROMO_STATES = {"active": "идёт", "paused": "на паузе", "other": "не показывается"}
+_PROMO_PAUSED_BY = {"autopilot": "остановил автопилот", "admin": "остановили вы", "cap": "лимит расходов",
+                   "season": "вне сезона"}
+_PROMO_PERIODS = {"week": "неделю", "day": "день"}
+_PROMO_MODE_DRY = "тест — ничего не меняю"
+_PROMO_MODE_AUTO = "автопилот"
+BTN_PROMO_DECLINE = "Не надо"
+BTN_PROMO_CHANNEL = "Провести Тайного Санту"
+
+
+def _rub(kop: int) -> str:
+    """Whole rubles, thousands apart: 1234560 kopecks → '12 346'."""
+    rubles = (abs(kop) + 50) // 100
+    return ("-" if kop < 0 else "") + f"{rubles:,}".replace(",", " ")
+
+
+def _rub_exact(kop: int) -> str:
+    """Rubles and kopecks, as the cabinets show net budgets: 38524 → '385,24'."""
+    return f"{kop // 100:,}".replace(",", " ") + f",{kop % 100:02d}"
+
+
+def btn_promo_raise(to_kop: int) -> str:
+    return f"Поднять до {_rub(to_kop)} ₽"
+
+
+def _promo_state(state: str, paused_by: str | None) -> str:
+    label = _PROMO_STATES[state]
+    if paused_by and state == "paused":
+        return f"{label} ({_PROMO_PAUSED_BY[paused_by]})"
+    if paused_by == "admin":
+        return f"{label}, без автопилота: вы её останавливали (/ads resume вернёт автопилот)"
+    return label
+
+
+# reasons of the rules (PROMO_SPEC §5)
+
+def promo_reason_season(*, ended: bool) -> str:
+    return "сезон закончился" if ended else "сезон ещё не начался"
+
+
+def promo_reason_cap(*, cap_kop: int, spent_kop: int, projected_kop: int) -> str:
+    return (f"достигнут лимит {_rub(cap_kop)} ₽: потрачено {_rub(spent_kop)} ₽, а ещё день с текущими "
+            f"бюджетами — это до {_rub(projected_kop)} ₽")
+
+
+def promo_reason_expensive(*, until: date, spend_kop: int, games: int, pause_cpa_kop: int) -> str:
+    spent = f"по {format_date(until)} потрачено {_rub(spend_kop)} ₽"
+    if not games:
+        return f"{spent}, а игр на 3+ участника нет"
+    return (f"{spent}, игр на 3+ участника: {games} — {_rub(spend_kop // games)} ₽ за игру, "
+            f"дороже порога {_rub(pause_cpa_kop)} ₽")
+
+
+def promo_reason_cheap(*, until: date, spend_kop: int, games: int, scale_cpa_kop: int) -> str:
+    return (f"по {format_date(until)} игр на 3+ участника: {games}, по {_rub(spend_kop // games)} ₽ за игру — "
+            f"дешевле порога {_rub(scale_cpa_kop)} ₽")
+
+
+# the daily report (PROMO_SPEC §7) and /ads
+
+def promo_report_header(*, day: date, dry: bool, spent_kop: int, cap_kop: int) -> str:
+    mode = _PROMO_MODE_DRY if dry else _PROMO_MODE_AUTO
+    return f"Реклама — {format_date(day)}. Режим: {mode}.\nПотрачено всего {_rub(spent_kop)} ₽ из {_rub(cap_kop)} ₽."
+
+
+def promo_campaign_line(*, platform: str, name: str, state: str, paused_by: str | None, yesterday_kop: int,
+                        total_kop: int, games3: int, cpa_kop: int | None, paid_rub: int) -> str:
+    cpa = "—" if cpa_kop is None else _rub(cpa_kop)
+    return (f"{_PROMO_PLATFORMS[platform]} «{name}»: вчера {_rub(yesterday_kop)} ₽, всего {_rub(total_kop)} ₽ · "
+            f"игр на 3+: {games3} · {cpa} ₽ за игру · оплат {paid_rub} ₽ · {_promo_state(state, paused_by)}")
+
+
+def promo_paused_line(*, name: str, reason: str, dry: bool) -> str:
+    return f"{'Сделал бы' if dry else 'Сделал'}: «{name}» — пауза: {reason}."
+
+
+def promo_pause_failed_line(*, name: str, reason: str, error: str) -> str:
+    return (f"Не получилось: «{name}» — пауза ({reason}) не удалась: {error}. "
+            "Остановите кампанию вручную в кабинете или командой /ads stop.")
+
+
+def promo_proposal_line(*, name: str, from_kop: int, to_kop: int, kind: str, reason: str, dry: bool) -> str:
+    verb = "Предложил бы" if dry else "Предлагаю"
+    return (f"{verb}: поднять бюджет «{name}» с {_rub(from_kop)} до {_rub(to_kop)} ₽ в {_PROMO_PERIODS[kind]}: "
+            f"{reason}.")
+
+
+def promo_link_entry(*, slug: str, users: int, games: int, games3: int, paid_rub: int) -> str:
+    return (f"{slug}: {users} чел., {games} {plural(games, 'игра', 'игры', 'игр')}, {games3} на 3+, "
+            f"оплат {paid_rub} ₽")
+
+
+def promo_links_line(entries: Sequence[str]) -> str:
+    return "Ссылки: " + " · ".join(entries)
+
+
+def promo_channel_line(*, posts: int, users: int, games: int) -> str:
+    return f"Канал MAX: постов {posts}, пришло {users} чел., игр {games}."
+
+
+def promo_no_credentials(platform: str) -> str:
+    keys = {"yd": "YANDEX_DIRECT_TOKEN", "vk": "VK_ADS_CLIENT_ID и VK_ADS_CLIENT_SECRET"}
+    return f"{_PROMO_PLATFORMS_FULL[platform]}: в .env нет {keys[platform]} — эти кампании не проверяю и не трогаю."
+
+
+def promo_auth_note(platform: str) -> str:
+    return (f"{_PROMO_PLATFORMS_FULL[platform]}: доступ не принят (как исправить — в отдельном сообщении), "
+            "цифры не обновлены.")
+
+
+def promo_fetch_failed(platform: str, detail: str, *, sandbox: bool = False) -> str:
+    text = (f"{_PROMO_PLATFORMS_FULL[platform]}: не удалось обновить данные ({shorten(detail, 150)}); "
+            "цифры — прошлые, попробую снова.")
+    if sandbox:
+        text += (" Включена песочница Директа (YANDEX_DIRECT_SANDBOX=1): возможно, она не работает с версией "
+                 "API v501 — проверьте с боевым доступом.")
+    return text
+
+
+PROMO_ERROR_NO_KEYS = "в .env нет ключей доступа к API этой площадки"
+PROMO_ERROR_AUTH = "площадка не приняла ключи доступа"
+PROMO_ERROR_BUSY = "площадка просит подождать: исчерпан лимит запросов"
+PROMO_ERROR_DOWN = "площадка не ответила"
+PROMO_ERROR_BUDGET_KIND = (
+    "у кампании нет бюджета, который я умею менять: в Директе нужен недельный бюджет стратегии, "
+    "в VK Рекламе — дневной бюджет кампании"
+)
+PROMO_ERROR_NOT_FOUND = "кампания не найдена в кабинете"
+PROMO_ERROR_UNREADABLE = "ответ площадки не удалось разобрать"
+
+
+def promo_error_platform(message: str) -> str:
+    return f"площадка ответила: {shorten(message, 150)}"
+
+
+def promo_campaign_missing(*, name: str, src: str) -> str:
+    return f"«{name}» не нашлась в кабинете — может быть, её удалили. Убрать из автопилота: /ads remove {src}"
+
+
+def promo_guard_report(lines: Sequence[str]) -> str:
+    return fit_lines(list(lines), header="Защита расходов:")
+
+
+# approvals of budget raises
+
+def promo_proposal(*, name: str, from_kop: int, to_kop: int, kind: str, net_kop: int, reason: str) -> str:
+    return (f"Предлагаю поднять бюджет «{name}» с {_rub(from_kop)} до {_rub(to_kop)} ₽ в {_PROMO_PERIODS[kind]}: "
+            f"{reason}. В кабинете это будет {_rub_exact(net_kop)} ₽ без НДС. Предложение действует сутки.")
+
+
+def promo_raise_applied(*, name: str, to_kop: int, kind: str, net_kop: int) -> str:
+    return (f"Готово: бюджет «{name}» теперь {_rub(to_kop)} ₽ в {_PROMO_PERIODS[kind]} "
+            f"(в кабинете {_rub_exact(net_kop)} ₽ без НДС).")
+
+
+def promo_raise_declined(*, name: str, from_kop: int) -> str:
+    return f"Хорошо, бюджет «{name}» оставляю {_rub(from_kop)} ₽."
+
+
+def promo_proposal_expired(reason: str) -> str:
+    return f"Не поднимаю бюджет: {reason}. Завтрашний отчёт всё посчитает заново."
+
+
+PROMO_PROPOSAL_DECIDED = {
+    "applied": "Этот бюджет уже подняли.",
+    "declined": "От этого предложения уже отказались.",
+    "failed": "Это предложение уже пробовали выполнить, но не получилось — подробности были в ответе.",
+    "expired": "Это предложение устарело — ждите завтрашний отчёт.",
+}
+PROMO_PROPOSAL_DRY = "Это предложение тестового режима — в нём я ничего не меняю. Включить автопилот: /ads auto on."
+PROMO_EXPIRED_OLD = "предложению больше суток"
+PROMO_EXPIRED_NOT_RUNNING = "кампания сейчас не идёт"
+PROMO_EXPIRED_REMOVED = "кампания больше не под управлением бота"
+PROMO_EXPIRED_CHANGED = "бюджет с тех пор уже меняли"
+
+
+def promo_expired_cap(cap_kop: int) -> str:
+    return f"с новым бюджетом расходы могут превысить лимит {_rub(cap_kop)} ₽"
+
+
+def promo_budget_failed(*, platform: str, name: str, net_kop: int, error: str) -> str:
+    if platform == "yd":
+        how = (f"Директ → кампания «{name}» → «Редактировать» → «Стратегия» → «Недельный бюджет» "
+               f"{_rub_exact(net_kop)} ₽")
+    else:
+        how = f"VK Реклама → кампания «{name}» → «Редактировать» → «Бюджет» → дневной {_rub_exact(net_kop)} ₽"
+    return f"Не удалось поменять бюджет «{name}»: {shorten(error, 200)}. Поменяйте вручную: {how} (без НДС)."
+
+
+# alerts when a platform refuses our keys (at most once per 6 hours per platform)
+
+def promo_auth_alert(*, platform: str, code: str, detail: str) -> str:
+    info = f" ({shorten(detail, 150)})" if detail else ""
+    if platform == "yd":
+        if code in ("53", "1002", "401", "403"):
+            return (f"Яндекс Директ не принял токен (ошибка {code}){info}. Получите новый OAuth-токен "
+                    "(docs/PROMO_KIT_RU.md, раздел 3, шаг «Токен»), впишите его в YANDEX_DIRECT_TOKEN в .env и "
+                    "выполните docker compose up -d. Пока токен не работает, я не вижу расходы Директа и не могу "
+                    "остановить его кампании.")
+        if code == "58":
+            return ("Заявка на доступ к API Директа ещё не одобрена (ошибка 58). Проверьте её: "
+                    "https://direct.yandex.ru/registered/main.pl?cmd=apiSettings → «Мои заявки». Проверка "
+                    "занимает от часа до трёх рабочих дней.")
+        return (f"У аккаунта Директа нет доступа к API (ошибка {code}){info}. Проверьте, что токен выдан тому "
+                "же логину Яндекса, на котором кампании, и что условия API приняты: "
+                "https://direct.yandex.ru/registered/main.pl?cmd=apiSettings")
+    if code == "invalid_client":
+        return ("VK Реклама не принимает VK_ADS_CLIENT_ID и VK_ADS_CLIENT_SECRET. Проверьте их в кабинете: "
+                "«Настройки» → «Доступ к API». Если секрет потерян, запросите доступ заново, впишите новые "
+                "значения в .env и выполните docker compose up -d.")
+    if code == "token_limit":
+        return ("VK Реклама не выдаёт новый токен доступа: у приложения уже 5 токенов, а удалить старые не "
+                "вышло. Проверьте /ads через час; если не помогло — напишите в поддержку API: ads_api@vk.team.")
+    return (f"VK Реклама отказала в доступе ({code}){info}. Проверьте в кабинете, что аккаунт активен и доступ "
+            "к API включён («Настройки» → «Доступ к API»).")
+
+
+# /ads and its subcommands
+
+PROMO_ADS_USAGE = (
+    "Команды рекламы:\n"
+    "/ads — сводка по кампаниям\n"
+    "/ads add yd НОМЕР [имя] — подключить кампанию Яндекс Директа\n"
+    "/ads add vk НОМЕР [имя] — подключить кампанию VK Рекламы\n"
+    "/ads remove ИСТОЧНИК — перестать управлять кампанией (на площадке она не останавливается)\n"
+    "/ads auto on|off — включить или выключить автопилот\n"
+    "/ads stop — остановить все кампании сейчас\n"
+    "/ads resume ИСТОЧНИК — снова запустить кампанию\n"
+    "/ads budget ИСТОЧНИК РУБЛИ — поставить бюджет (сумма с НДС)\n"
+    "/ads cap РУБЛИ — общий лимит расходов (с НДС)\n"
+    "/ads rules ДОРОГО ДЁШЕВО [МИНИМУМ] [ПРОЦЕНТ] [ДНИ] — пороги автопилота\n"
+    "ИСТОЧНИК — например yd701234567 или vk123456, он есть в /ads."
+)
+PROMO_ADD_USAGE = "Формат: /ads add yd НОМЕР [имя] или /ads add vk НОМЕР [имя]. НОМЕР — цифры из кабинета."
+PROMO_AUTO_USAGE = "Формат: /ads auto on или /ads auto off"
+PROMO_SRC_USAGE = "Укажите источник кампании, например yd701234567 — список в /ads."
+PROMO_BUDGET_USAGE = "Формат: /ads budget ИСТОЧНИК РУБЛИ, например /ads budget yd701234567 2000 (сумма с НДС)."
+PROMO_CAP_USAGE = "Формат: /ads cap РУБЛИ, например /ads cap 15000 (сумма с НДС)."
+PROMO_RULES_USAGE = (
+    "Формат: /ads rules ДОРОГО ДЁШЕВО [МИНИМУМ] [ПРОЦЕНТ] [ДНИ], например /ads rules 250 150 500 30 2. "
+    "ДЁШЕВО меньше ДОРОГО, ПРОЦЕНТ — рост бюджета за раз, от 1 до 100, ДНИ — через сколько дней учитывать "
+    "игру, от 0 до 14."
+)
+PROMO_NO_CAMPAIGNS = "Кампаний под управлением пока нет. Подключить: /ads add yd НОМЕР или /ads add vk НОМЕР."
+PROMO_AUTO_OFF = (
+    "Автопилот выключен: дальше я только пишу, что сделал бы. Команды /ads stop, /ads resume и /ads budget "
+    "работают как раньше."
+)
+
+
+def promo_status_header(*, dry: bool, spent_kop: int, cap_kop: int) -> str:
+    mode = _PROMO_MODE_DRY if dry else _PROMO_MODE_AUTO
+    return f"Реклама. Режим: {mode}.\nПотрачено всего {_rub(spent_kop)} ₽ из {_rub(cap_kop)} ₽."
+
+
+def promo_rules_summary(*, pause_cpa_rub: int, scale_cpa_rub: int, min_spend_rub: int, max_raise_pct: int,
+                        lag_days: int, season: str) -> str:
+    return (f"Пороги: останавливаю кампанию, если игра на 3+ участника обходится дороже {pause_cpa_rub} ₽ "
+            f"(или игр нет) после {min_spend_rub} ₽ расходов; предлагаю поднять бюджет (до +{max_raise_pct}%), "
+            f"если игра дешевле {scale_cpa_rub} ₽. Игры считаю с задержкой {lag_days} дн. Сезон рекламы: {season}.")
+
+
+def promo_status_line(*, platform: str, name: str, src: str, state: str, paused_by: str | None,
+                      yesterday_kop: int, total_kop: int, games3: int, cpa_kop: int | None, paid_rub: int,
+                      downstream_games: int, budget_kop: int | None, kind: str | None) -> str:
+    cpa = "—" if cpa_kop is None else _rub(cpa_kop)
+    payback = f"{paid_rub * 10000 // total_kop}%" if total_kop else "—"
+    budget = f"{_rub(budget_kop)} ₽ в {_PROMO_PERIODS[kind]}" if budget_kop is not None and kind else "не виден"
+    spread = ""
+    if downstream_games:
+        spread = (f" · участники этих игр устроили ещё {downstream_games} "
+                  f"{plural(downstream_games, 'игру', 'игры', 'игр')}")
+    return (f"{_PROMO_PLATFORMS[platform]} «{name}» ({src}): {_promo_state(state, paused_by)} · вчера "
+            f"{_rub(yesterday_kop)} ₽, всего {_rub(total_kop)} ₽ · игр на 3+: {games3} · {cpa} ₽ за игру · "
+            f"оплат {paid_rub} ₽, окупаемость {payback}{spread} · бюджет {budget}")
+
+
+def promo_waiting_proposal(*, name: str, to_kop: int) -> str:
+    return f"Ждёт решения: поднять бюджет «{name}» до {_rub(to_kop)} ₽ — кнопки в сообщении после отчёта."
+
+
+def promo_registered(*, platform: str, name: str, src: str, validated: bool, landing_url: str,
+                     template: str) -> str:
+    lines = [f"Подключил: {_PROMO_PLATFORMS_FULL[platform]} «{name}», источник {src}."]
+    if not validated:
+        lines.append("Проверить кампанию не смог — нет доступа к API площадки (см. .env). Проверьте номер сами.")
+    lines += ["Ссылка для объявлений этой кампании:", landing_url]
+    if platform == "yd":
+        lines += ["Или одна ссылка на все кампании Директа — номер кампании Директ подставит сам:", template]
+    else:
+        lines += [
+            "Или в группе объявлений: «Параметры URL» → «Добавлять UTM-метки вручную» → впишите:", template,
+            "Тогда в объявлениях — просто адрес сайта. Автоматические UTM-метки VK не оставляйте: они заменят "
+            "эту разметку, и я не увижу, откуда пришли люди.",
+        ]
+    lines.append("Пока автопилот в тесте (/ads auto on — включить), я только пишу, что сделал бы.")
+    return "\n".join(lines)
+
+
+def promo_not_found(*, platform: str, external_id: str) -> str:
+    return (f"В кабинете {_PROMO_PLATFORMS_FULL[platform]} не нашлось кампании {external_id} (или у доступа нет к ней "
+            "прав). Проверьте номер.")
+
+
+def promo_unreachable(*, platform: str, detail: str) -> str:
+    return (f"{_PROMO_PLATFORMS_FULL[platform]} сейчас не отвечает ({shorten(detail, 150)}). "
+            "Попробуйте через несколько минут.")
+
+
+def promo_unknown_src(src: str) -> str:
+    return f"Не знаю кампанию «{src}». Список — /ads."
+
+
+def promo_removed(*, name: str, src: str) -> str:
+    return (f"Больше не управляю «{name}» ({src}). На площадке она не остановлена — если нужно, остановите её "
+            "в кабинете. Её расходы остаются в общем лимите.")
+
+
+def promo_auto_on(*, cap_kop: int, spent_kop: int, rules: str) -> str:
+    return (
+        "Автопилот включён. Что я теперь делаю сам:\n"
+        "— каждый день в отчёте сверяю расходы с играми, которые принесла реклама;\n"
+        "— останавливаю дорогие кампании (без вопросов);\n"
+        "— предлагаю поднять бюджет дешёвым — поднимаю, только если вы нажмёте кнопку;\n"
+        f"— останавливаю всё, если расходы могут превысить лимит {_rub(cap_kop)} ₽ (сейчас потрачено "
+        f"{_rub(spent_kop)} ₽), и вне сезона рекламы;\n"
+        "— снова запускаю кампании только по вашей команде /ads resume.\n"
+        f"{rules}\n"
+        "Выключить: /ads auto off. Остановить всё сразу: /ads stop."
+    )
+
+
+def promo_stop_line(*, name: str, error: str | None) -> str:
+    return f"«{name}» — остановлена" if error is None else f"«{name}» — не получилось: {shorten(error, 150)}"
+
+
+def promo_stopped(lines: Sequence[str]) -> str:
+    return fit_lines(list(lines), header="Остановил все кампании (автопилот их больше не запустит):",
+                     footer="Запустить снова: /ads resume ИСТОЧНИК.")
+
+
+def promo_resumed(name: str) -> str:
+    return f"Запустил «{name}». Автопилот снова следит за ней."
+
+
+def promo_resume_out_of_season(*, ended: bool) -> str:
+    return f"Не запускаю: {promo_reason_season(ended=ended)} (PROMO_START и PROMO_END в .env)."
+
+
+def promo_over_cap(*, cap_kop: int, projected_kop: int) -> str:
+    return (f"Не делаю: с этим расходы за следующий день могут дойти до {_rub(projected_kop)} ₽ — больше лимита "
+            f"{_rub(cap_kop)} ₽. Поднимите лимит (/ads cap) или уменьшите бюджеты.")
+
+
+def promo_action_failed(*, name: str, error: str) -> str:
+    return f"Не получилось с «{name}»: {shorten(error, 200)}. Попробуйте ещё раз или сделайте это в кабинете."
+
+
+def promo_budget_too_small(min_kop: int) -> str:
+    return f"Бюджет не может быть меньше {_rub(min_kop)} ₽ с НДС (это 300 ₽ без НДС — минимум площадок)."
+
+
+def promo_budget_set(*, name: str, gross_kop: int, kind: str, net_kop: int) -> str:
+    return (f"Бюджет «{name}»: {_rub(gross_kop)} ₽ в {_PROMO_PERIODS[kind]} с НДС, в кабинете будет "
+            f"{_rub_exact(net_kop)} ₽ без НДС.")
+
+
+def promo_cap_set(*, cap_kop: int, spent_kop: int) -> str:
+    return f"Общий лимит расходов: {_rub(cap_kop)} ₽ с НДС. Уже потрачено {_rub(spent_kop)} ₽."
+
+
+# manual tracking links (/link, /links)
+
+LINK_USAGE = (
+    "Формат: /link СЛОВО [название], например /link habr Пост на Хабре. СЛОВО — до 15 латинских букв и цифр."
+)
+LINKS_EMPTY = "Ссылок пока нет. Создать: /link СЛОВО [название]."
+
+
+def link_created(*, title: str, src: str, landing_url: str, bot_url: str, existed: bool) -> str:
+    first = f"Такая ссылка уже есть: «{title}» ({src})." if existed else f"Ссылка «{title}» ({src}) готова."
+    return (f"{first}\nНа сайт (лучше для постов и сообщений — там есть описание и цены):\n{landing_url}\n"
+            f"Сразу в бота:\n{bot_url}\nЧто она принесла — /links.")
+
+
+def links_report(lines: Sequence[str]) -> str:
+    return fit_lines(list(lines), header="Ссылки (люди, игры, игры на 3+ участника, оплаты):")
+
+
+def link_line(*, title: str, entry: str) -> str:
+    return f"«{title}» — {entry}"
+
+
+# the owner's MAX channel (/channel)
+
+CHANNEL_USAGE = "Формат: /channel, /channel test, /channel on, /channel off или /channel send ch01"
+CHANNEL_NO_ID = (
+    "Не задан PROMO_MAX_CHANNEL_ID. Добавьте бота администратором в ваш канал — я пришлю его id, — впишите "
+    "его в .env и выполните docker compose up -d."
+)
+CHANNEL_OFF = "Посты в канал выключены. Включить: /channel on."
+CHANNEL_NOTHING_LEFT = "Все посты календаря уже отправлены или пропущены."
+
+
+def channel_status(*, on: bool, channel_id: int | None, sent: int, skipped: int, total: int,
+                   upcoming: Sequence[str], known: Sequence[int]) -> str:
+    lines = [
+        f"Посты в канал MAX: {'включены' if on else 'выключены'}. Канал: "
+        f"{channel_id if channel_id is not None else 'не задан (PROMO_MAX_CHANNEL_ID)'}.",
+        f"Календарь: {total} постов, отправлено {sent}, пропущено {skipped}.",
+    ]
+    lines += ["Следующие:", *upcoming] if upcoming else [CHANNEL_NOTHING_LEFT]
+    if known:
+        lines.append("Каналы, куда добавили бота: " + ", ".join(str(chat_id) for chat_id in known))
+    lines.append("Команды: /channel test — пример следующего поста вам; /channel on|off; /channel send ch01.")
+    return "\n".join(lines)
+
+
+def channel_upcoming_line(*, post_id: str, when: str, first_line: str) -> str:
+    return f"{post_id} — {when}: {shorten(first_line, 80)}"
+
+
+def channel_on(*, channel_id: int) -> str:
+    return f"Посты в канал {channel_id} включены: отправляю по календарю, ближайшие — в /channel."
+
+
+def channel_sent(post_id: str) -> str:
+    return f"Пост {post_id} отправлен в канал (появится через несколько секунд)."
+
+
+def channel_already_sent(post_id: str) -> str:
+    return f"Пост {post_id} уже был в канале — второй раз не отправляю."
+
+
+def channel_unknown_post(post_id: str) -> str:
+    return f"Нет поста «{post_id}». Номера — в /channel (ch01, ch02…)."
+
+
+def channel_preview(*, post_id: str, when: str) -> str:
+    return f"Так будет выглядеть пост {post_id} (по плану — {when}):"
+
+
+def channel_added(chat_id: int) -> str:
+    return (f"Бота добавили в канал, его id: {chat_id}. Если это ваш канал для постов, впишите в .env строку "
+            f"PROMO_MAX_CHANNEL_ID={chat_id}, выполните docker compose up -d и проверьте: /channel test.")
+
+
+def promo_post_failed(error: str) -> str:
+    return (f"Пост не ушёл в канал MAX: {shorten(error, 200)}. Проверьте, что бот — администратор канала, "
+            "а PROMO_MAX_CHANNEL_ID верный.")

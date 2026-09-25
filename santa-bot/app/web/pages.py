@@ -85,7 +85,7 @@ def bot_link(config: Config, payload: str | None = None) -> str | None:
 
 
 def landing_bot_link(config: Config, src: str | None) -> str | None:
-    """'Открыть бота' carries s_{src}, src from utm_source or src, sanitized (§6.6)."""
+    """'Открыть бота' carries s_{src}, src from src or utm_source, sanitized (§6.6)."""
     return bot_link(config, source_payload(src or ""))
 
 

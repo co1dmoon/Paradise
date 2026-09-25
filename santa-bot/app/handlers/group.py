@@ -7,6 +7,8 @@
   in the chat never trigger bot actions. It is edited when the game changes, at
   most once per 10 s per game; if the edit fails, a new card is posted.
 - bot_removed: the chat's games continue in link mode.
+- bot_added in a channel: nothing is posted there; with PROMO_ENABLED=1 the admins get the
+  channel's id for PROMO_MAX_CHANNEL_ID (PROMO_SPEC §9.5).
 
 The owner must first allow group chats in the bot settings (this re-triggers moderation).
 """
@@ -20,12 +22,15 @@ from app.core.games import ACTIVE, Reveal
 from app.core.models import Game
 from app.handlers import views
 from app.max_api import BotAdded, BotRemoved, Target
+from app.promo import channel
 
 CARD_INTERVAL = 10.0
 
 
 async def on_bot_added(ctx: AppContext, update: BotAdded) -> None:
     if update.is_channel:
+        if ctx.config.promo.enabled:
+            await channel.channel_added(ctx, update)
         return
     await ctx.outbox.send_now(Target.chat(update.chat_id), views.group_hello(ctx.config, update.chat_id))
     await record(ctx.db, Event.GROUP_ADDED, ctx.clock.now(), user_id=update.user.user_id if update.user else None)

@@ -7,7 +7,7 @@ from app.core import games, texts
 from app.core.clock import Clock
 from app.db import Db
 from app.max_api import BadRequest, MaxApiError, OutMessage, Target
-from app.outbox import PURPOSE_ALERT, PURPOSE_DRAW_RESULT, Outbox, OutboxItem
+from app.outbox import PURPOSE_ALERT, PURPOSE_DRAW_RESULT, PURPOSE_PROMO_POST, Outbox, OutboxItem
 
 BAD_REQUEST_ALERT_INTERVAL = 5 * 60.0
 
@@ -17,7 +17,9 @@ class DeliveryTracker:
 
     - A draw result (purpose ``draw_result``) sets participants.result_dm_ok; when the
       last result of a draw resolves, the organizer gets the 'Пары отправлены' summary.
-    - BadRequest on a non-alert message is reported to the admins (throttled).
+    - A post MAX refused for the owner's channel (purpose ``promo_post``) is reported to the
+      admins with the likely fix (throttled).
+    - BadRequest on any other non-alert message is reported to the admins (throttled).
     - A rejected token (401) is reported to the admins (throttled).
     """
 
@@ -34,7 +36,10 @@ class DeliveryTracker:
     async def on_failed(self, target: Target, error: MaxApiError, item: OutboxItem | None) -> None:
         if item is not None and item.purpose == PURPOSE_DRAW_RESULT:
             await self._draw_result(item, delivered=False)
-        if isinstance(error, BadRequest) and (item is None or item.purpose != PURPOSE_ALERT):
+        if item is not None and item.purpose == PURPOSE_PROMO_POST:
+            await self._alerts.alert("promo_post", texts.promo_post_failed(error.detail),
+                                     min_interval=BAD_REQUEST_ALERT_INTERVAL)
+        elif isinstance(error, BadRequest) and (item is None or item.purpose != PURPOSE_ALERT):
             await self._alerts.alert(
                 "bad_request",
                 texts.message_rejected(target=target.key, error=error.detail),

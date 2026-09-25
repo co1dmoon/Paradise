@@ -7,6 +7,8 @@ Startup: config is validated before the app is built (fail fast), then
 3. webhook mode: post our subscription (url, update types, secret); polling mode: start the poller;
 4. start the outbox worker and the scheduler.
 Without MAX_BOT_TOKEN steps 2–3 and the outbox are skipped: only the website runs.
+With PROMO_ENABLED=1 the ad autopilot's settings are seeded and the clients of the ad
+platforms that have credentials are built (PROMO_SPEC); they are closed on shutdown.
 
 Seams for later stages: ``handlers.router.dispatch(ctx, update)`` (via
 ``app.updates.process_update``), ``web.routes.register(app)`` and
@@ -34,6 +36,8 @@ from app.delivery import DeliveryTracker
 from app.log import setup_logging
 from app.max_api import HttpMaxApi, MaxApi, MaxApiError, Unauthorized
 from app.outbox import Outbox
+from app.promo import autopilot
+from app.promo import store as promo_store
 from app.tls import build_ssl_context
 from app.updates import process_update
 from app.web import routes
@@ -56,12 +60,16 @@ async def build_context(
     db = await Database.open(config.db_path)
     await db.migrate()
     await repo.seed_settings(db, config.default_settings)
+    if config.promo.enabled:
+        await promo_store.seed_settings(db, promo_store.default_settings(config.promo))
+    ssl_context = build_ssl_context()
     if api is None:
-        api = HttpMaxApi(config.max_bot_token, config.max_api_base, build_ssl_context())
+        api = HttpMaxApi(config.max_bot_token, config.max_api_base, ssl_context)
     outbox = Outbox(db, api, clock)
     alerts = Alerter(outbox, config.admin_user_ids, clock)
     outbox.hooks = DeliveryTracker(db, outbox, alerts, clock)
-    return AppContext(config, db, api, outbox, alerts, clock, rng or random.SystemRandom())
+    return AppContext(config, db, api, outbox, alerts, clock, rng or random.SystemRandom(),
+                      ad_platforms=autopilot.build_platforms(config, db, clock, ssl_context))
 
 
 def create_app(
@@ -87,6 +95,8 @@ def create_app(
         await ctx.wait_background()
         await ctx.outbox.stop()
         await ctx.api.close()
+        for platform in ctx.ad_platforms.values():
+            await platform.close()
         await ctx.db.close()
         log.info("stopped")
 

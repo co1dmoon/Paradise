@@ -55,6 +55,7 @@ IDLE_POLL_SECONDS = 2.0
 BATCH_SIZE = 100
 PURPOSE_DRAW_RESULT = "draw_result"
 PURPOSE_ALERT = "alert"
+PURPOSE_PROMO_POST = "promo_post"  # a post in the owner's MAX channel (app.promo.channel)
 _RETRYABLE = (RateLimited, Transient, Unauthorized)
 
 

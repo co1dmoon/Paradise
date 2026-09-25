@@ -24,6 +24,7 @@ import string
 import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import time
 from pathlib import Path
 from urllib.parse import SplitResult, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -40,6 +41,11 @@ _USERNAME_RE = re.compile(r"^[A-Za-z0-9_.]{3,64}$")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _DOMAIN_RE = re.compile(r"^[^\s/:@]+\.[^\s/:@.]+$")
 _MONTH_DAY_RE = re.compile(r"^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
+_CLOCK_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+_CHAT_ID_RE = re.compile(r"^-?[0-9]{1,20}$")
+MAX_AD_LABEL = 300
+MAX_RAISE_PCT = 100
+MAX_LAG_DAYS = 14
 _TRUE = {"1", "true", "yes", "on", "да"}
 _FALSE = {"0", "false", "no", "off", "нет", ""}
 
@@ -62,6 +68,38 @@ GENERATED_SECRETS = (
     GeneratedSecret("WEBHOOK_PATH_SECRET", string.ascii_letters + string.digits, 24),
     GeneratedSecret("ADMIN_EXPORT_TOKEN", string.ascii_letters + string.digits, 32),
 )
+
+
+@dataclass(frozen=True, slots=True)
+class PromoConfig:
+    """The ad autopilot (PROMO_SPEC §10). The thresholds seed the promo settings once (on the
+    first start with PROMO_ENABLED=1); after that the database wins, like the prices."""
+
+    enabled: bool
+    direct_token: str
+    direct_sandbox: bool
+    vk_client_id: str
+    vk_client_secret: str
+    cap_rub: int
+    pause_cpa_rub: int
+    scale_cpa_rub: int
+    min_spend_rub: int
+    max_raise_pct: int
+    lag_days: int
+    season_start: str  # 'MM-DD', Moscow dates
+    season_end: str
+    vat_pct: int
+    report_time: time
+    channel_id: int | None
+    channel_ad_label: str
+
+    @property
+    def direct_configured(self) -> bool:
+        return bool(self.direct_token)
+
+    @property
+    def vk_configured(self) -> bool:
+        return bool(self.vk_client_id and self.vk_client_secret)
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +137,7 @@ class Config:
     s3_key: str
     s3_secret: str
     s3_region: str
+    promo: PromoConfig
     warnings: tuple[str, ...] = field(default=())
 
     @property
@@ -180,12 +219,14 @@ class _Reader:
         self.problems.append(f"{name} должен быть 0 или 1 (сейчас: {raw!r}).")
         return default
 
-    def integer(self, name: str, default: int, *, minimum: int = 1) -> int:
+    def integer(self, name: str, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
         raw = self.text(name)
         if not raw:
             return default
-        if not raw.isdigit() or int(raw) < minimum:
-            self.problems.append(f"{name} должен быть целым числом не меньше {minimum} (сейчас: {raw!r}).")
+        valid = raw.isascii() and raw.isdigit()
+        if not valid or int(raw) < minimum or (maximum is not None and int(raw) > maximum):
+            bounds = f"не меньше {minimum}" if maximum is None else f"от {minimum} до {maximum}"
+            self.problems.append(f"{name} должен быть целым числом {bounds} (сейчас: {raw!r}).")
             return default
         return int(raw)
 
@@ -373,6 +414,7 @@ def _build(reader: _Reader, data_dir: Path, generated: Mapping[str, str]) -> Con
         s3_key=s3["S3_KEY"],
         s3_secret=s3["S3_SECRET"],
         s3_region=reader.text("S3_REGION", "ru-central1"),
+        promo=_promo(reader),
         warnings=tuple(reader.warnings),
     )
 
@@ -431,3 +473,71 @@ def _admin_ids(reader: _Reader) -> tuple[int, ...]:
         else:
             reader.problems.append(f"ADMIN_USER_IDS: {part!r} — не число. Пример: 12345678,87654321.")
     return tuple(ids)
+
+
+def _promo(reader: _Reader) -> PromoConfig:
+    """PROMO_* and the ad platforms' credentials (PROMO_SPEC §10). Malformed values stop the start;
+    missing credentials only switch that platform off."""
+    enabled = reader.flag("PROMO_ENABLED", False)
+    vk_client_id, vk_client_secret = reader.text("VK_ADS_CLIENT_ID"), reader.text("VK_ADS_CLIENT_SECRET")
+    if bool(vk_client_id) != bool(vk_client_secret):
+        reader.problems.append("Для VK Рекламы заполните оба значения: VK_ADS_CLIENT_ID и VK_ADS_CLIENT_SECRET.")
+    pause_cpa = reader.integer("PROMO_PAUSE_CPA_RUB", 250)
+    scale_cpa = reader.integer("PROMO_SCALE_CPA_RUB", 150)
+    if scale_cpa >= pause_cpa:
+        reader.problems.append(
+            f"PROMO_SCALE_CPA_RUB ({scale_cpa}) должен быть меньше PROMO_PAUSE_CPA_RUB ({pause_cpa}): "
+            "бюджет поднимают только дешёвым кампаниям, а останавливают дорогие."
+        )
+    season_start, season_end = reader.text("PROMO_START", "11-24"), reader.text("PROMO_END", "12-12")
+    for name, value in (("PROMO_START", season_start), ("PROMO_END", season_end)):
+        if not _MONTH_DAY_RE.match(value):
+            reader.problems.append(f"{name} должен быть в формате ММ-ДД, например 11-24 (сейчас: {value!r}).")
+    report_time = _clock_time(reader, "PROMO_REPORT_TIME", "10:00")
+    channel_id = _optional_chat_id(reader, "PROMO_MAX_CHANNEL_ID")
+    label = reader.text("PROMO_CHANNEL_AD_LABEL")
+    if len(label) > MAX_AD_LABEL:
+        reader.problems.append(f"PROMO_CHANNEL_AD_LABEL длиннее {MAX_AD_LABEL} символов.")
+    config = PromoConfig(
+        enabled=enabled,
+        direct_token=reader.text("YANDEX_DIRECT_TOKEN"),
+        direct_sandbox=reader.flag("YANDEX_DIRECT_SANDBOX", False),
+        vk_client_id=vk_client_id,
+        vk_client_secret=vk_client_secret,
+        cap_rub=reader.integer("PROMO_CAP_RUB", 15000),
+        pause_cpa_rub=pause_cpa,
+        scale_cpa_rub=scale_cpa,
+        min_spend_rub=reader.integer("PROMO_MIN_SPEND_RUB", 500),
+        max_raise_pct=reader.integer("PROMO_MAX_RAISE_PCT", 30, maximum=MAX_RAISE_PCT),
+        lag_days=reader.integer("PROMO_LAG_DAYS", 2, minimum=0, maximum=MAX_LAG_DAYS),
+        season_start=season_start,
+        season_end=season_end,
+        vat_pct=reader.integer("PROMO_VAT_PCT", 22, minimum=0, maximum=50),
+        report_time=report_time,
+        channel_id=channel_id,
+        channel_ad_label=label,
+    )
+    if enabled and not (config.direct_configured or config.vk_configured):
+        reader.warnings.append("PROMO_ENABLED=1, но не заданы ни YANDEX_DIRECT_TOKEN, ни VK_ADS_CLIENT_ID с "
+                               "VK_ADS_CLIENT_SECRET: работают только ссылки /link и канал.")
+    return config
+
+
+def _clock_time(reader: _Reader, name: str, default: str) -> time:
+    raw = reader.text(name, default)
+    match = _CLOCK_RE.match(raw)
+    if match is None:
+        reader.problems.append(f"{name} должен быть в формате ЧЧ:ММ, например {default} (сейчас: {raw!r}).")
+        return time.fromisoformat(default)
+    return time(int(match.group(1)), int(match.group(2)))
+
+
+def _optional_chat_id(reader: _Reader, name: str) -> int | None:
+    raw = reader.text(name)
+    if not raw:
+        return None
+    if not _CHAT_ID_RE.match(raw):
+        reader.problems.append(f"{name} — это число (id канала, его пришлёт бот), например -123456789 "
+                               f"(сейчас: {raw!r}).")
+        return None
+    return int(raw)

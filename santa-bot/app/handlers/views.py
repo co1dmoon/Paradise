@@ -114,6 +114,8 @@ class Action(StrEnum):
     ADMIN_FORGET_CONFIRM = "afy"
     ADMIN_CLEAR_REPORTED = "acr"
     ADMIN_RESET_TITLE = "art"
+    PROMO_APPROVE = "pa"
+    PROMO_DECLINE = "pd"
 
 
 def button(text: str, action: Action, *args: str | int) -> kb.CallbackButton:
@@ -720,3 +722,12 @@ def confirm_admin_cancel(game: Game) -> OutMessage:
         texts.confirm_admin_cancel(code=game.code, title=game.title),
         kb.keyboard(button(texts.BTN_CONFIRM_CANCEL_GAME, Action.ADMIN_CANCEL_CONFIRM, game.id)),
     )
+
+
+# --- PROMO_SPEC §6: a budget raise waiting for an admin's tap ------------------------------------------------
+
+
+def promo_proposal(action_id: int, text: str, to_kop: int) -> OutMessage:
+    """[Поднять до X ₽] [Не надо]; the handlers re-check everything in the database."""
+    return OutMessage(text, kb.keyboard([button(texts.btn_promo_raise(to_kop), Action.PROMO_APPROVE, action_id),
+                                         button(texts.BTN_PROMO_DECLINE, Action.PROMO_DECLINE, action_id)]))

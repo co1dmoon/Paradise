@@ -24,6 +24,7 @@ from app.debounce import Debouncer
 from app.locks import Locks
 from app.max_api import MaxApi
 from app.outbox import Outbox
+from app.promo.platforms import AdPlatform, Platform
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ class AppContext:
     rng: random.Random
     locks: Locks = field(default_factory=Locks)
     runtime: RuntimeState = field(default_factory=RuntimeState)
+    ad_platforms: dict[Platform, AdPlatform] = field(default_factory=dict)  # PROMO_SPEC §3: configured ones only
     debouncer: Debouncer = field(init=False)
     _tasks: set[asyncio.Task[Any]] = field(default_factory=set)
 

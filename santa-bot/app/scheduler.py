@@ -5,7 +5,9 @@ Schedule (Moscow time, config TZ); the job bodies live in ``app.jobs``:
 - every minute: join and waiting notices, organizer nudges;
 - 12:00 pre-exchange reminders; 00:10 ending games; 03:30 data retention;
   04:00 backup; 09:00 certificate expiry check; 21:00 the admins' digest;
-- every 10 minutes (webhook mode): the webhook watchdog.
+- every 10 minutes (webhook mode): the webhook watchdog;
+- with PROMO_ENABLED=1 (PROMO_SPEC §6, §8): the ad report at PROMO_REPORT_TIME (10:00),
+  the budget guard every 2 hours and the own-channel posts every 10 minutes.
 
 The outbox worker runs on its own (``Outbox.start``, started by ``app.main``).
 
@@ -37,10 +39,12 @@ from aiohttp import web
 from app import jobs, repo
 from app.config import Config
 from app.context import CTX_KEY, AppContext
+from app.promo import autopilot, channel
 
 log = logging.getLogger(__name__)
 
 TICK_SECONDS = 30.0
+CHANNEL_INTERVAL = 600.0
 
 JobBody = Callable[[AppContext], Awaitable[None]]
 
@@ -101,6 +105,12 @@ def jobs_for(config: Config) -> list[Job]:
     ]
     if config.mode == "webhook":
         schedule.append(Job("webhook_watchdog", Every(600), jobs.webhook_watchdog))
+    if config.promo.enabled:
+        schedule += [
+            Job("promo_daily", DailyAt(config.promo.report_time), autopilot.daily_job),
+            Job("promo_guard", Every(autopilot.GUARD_INTERVAL), autopilot.guard_job),
+            Job("promo_channel", Every(CHANNEL_INTERVAL), channel.post_due),
+        ]
     return schedule
 
 

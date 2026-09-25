@@ -84,7 +84,8 @@ async def _render(request: web.Request, template: str, **values: Any) -> web.Res
 
 async def landing(request: web.Request) -> web.Response:
     ctx = _ctx(request)
-    src = request.query.get("utm_source") or request.query.get("src")
+    # The explicit src (tracking links, PROMO_SPEC §2) wins over utm_source, which ad platforms may add themselves.
+    src = request.query.get("src") or request.query.get("utm_source")
     draws = await request.app[COUNTER_KEY].visible(ctx)
     return await _render(
         request, "index.html",

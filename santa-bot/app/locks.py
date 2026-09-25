@@ -1,7 +1,9 @@
-"""Per-user and per-game asyncio locks (§11).
+"""Per-user and per-game asyncio locks (§11), and one lock for the ad autopilot.
 
 A per-user lock serializes each user's updates; a per-game lock covers join,
-limit, payment and draw. Locks disappear when nobody holds or waits for them.
+limit, payment and draw. Keyed locks disappear when nobody holds or waits for them.
+The promo lock serializes the autopilot's decisions with the admins' ad commands
+(PROMO_SPEC §6), so a budget is never decided on stale numbers.
 """
 
 from __future__ import annotations
@@ -26,3 +28,4 @@ class Locks:
     def __init__(self) -> None:
         self.user = KeyedLocks()
         self.game = KeyedLocks()
+        self.promo = asyncio.Lock()

@@ -1,1 +1,1 @@
-"""Developer tools: the fake MAX API and the simulator."""
+"""Developer tools: the fake MAX API, the fake ad platforms and the simulator."""
