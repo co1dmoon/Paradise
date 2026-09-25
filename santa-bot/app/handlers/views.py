@@ -31,6 +31,7 @@ from app.core.models import (
     RelayDirection,
     Report,
     Settings,
+    Tier,
 )
 from app.core.payloads import deep_link, group_payload, join_payload, new_game_payload
 from app.core.pricing import PAID_TIERS, Upgrade
@@ -110,6 +111,9 @@ class Action(StrEnum):
     ADMIN_GRANT = "ag"
     ADMIN_CANCEL = "ac"
     ADMIN_CANCEL_CONFIRM = "acy"
+    ADMIN_FORGET_CONFIRM = "afy"
+    ADMIN_CLEAR_REPORTED = "acr"
+    ADMIN_RESET_TITLE = "art"
 
 
 def button(text: str, action: Action, *args: str | int) -> kb.CallbackButton:
@@ -287,11 +291,12 @@ def wishes_saved(game: Game) -> OutMessage:
     )
 
 
-def waiting(game: Game, settings: Settings, upgrade: Upgrade | None) -> OutMessage:
+def waiting(game: Game, upgrade: Upgrade | None) -> OutMessage:
     """§5.6: the queue message; ``upgrade`` is None when nobody can pay (top tier, payments off)."""
     if upgrade is None:
         return OutMessage(texts.WAITING_LIST_FULL)
-    text = texts.waiting_list(free_limit=settings.free_limit, limit=upgrade.limit, price=upgrade.amount)
+    text = texts.waiting_list(free=game.tier == Tier.FREE, current_limit=game.participant_limit,
+                              limit=upgrade.limit, price=upgrade.amount)
     return OutMessage(text, kb.keyboard(pay_button(game, upgrade)))
 
 
@@ -303,10 +308,11 @@ def spot_opened(game: Game) -> OutMessage:
     )
 
 
-def confirm_leave(game: Game) -> OutMessage:
-    drawn = game.status == GameStatus.DRAWN
+def confirm_leave(game: Game, me: Participant) -> OutMessage:
+    """Leaving an active place after the draw re-links the pairs, so the text says so."""
+    splices = game.status == GameStatus.DRAWN and me.status == ParticipantStatus.ACTIVE
     return OutMessage(
-        texts.confirm_leave_after_draw(game.title) if drawn else texts.confirm_leave(game.title),
+        texts.confirm_leave_after_draw(game.title) if splices else texts.confirm_leave(game.title),
         kb.keyboard([button(texts.BTN_CONFIRM_LEAVE, Action.LEAVE_CONFIRM, game.id),
                      button(texts.BTN_CANCEL, Action.OPEN_GAME, game.id)]),
     )
@@ -319,11 +325,13 @@ def my_games(user_id: int, entries: Sequence[tuple[Game, Participant | None]], p
     if not entries:
         return menu(texts.NO_GAMES)
     current = kb.paginate(entries, page)
+    first = current.number * kb.PAGE_SIZE + 1  # numbers tie each line to its button: titles repeat
+    numbered = list(enumerate(current.items, start=first))
     lines = [
-        texts.my_game_line(title=game.title, status=game.status, role=_role(user_id, game, participant))
-        for game, participant in current.items
+        f"{number}. " + texts.my_game_line(title=game.title, status=game.status, role=_role(user_id, game, participant))
+        for number, (game, participant) in numbered
     ]
-    buttons = [button(game.title, Action.OPEN_GAME, game.id) for game, _ in current.items]
+    buttons = [button(f"{number}. {game.title}", Action.OPEN_GAME, game.id) for number, (game, _) in numbered]
     keyboard = kb.paged_keyboard(
         buttons, current.number, lambda number: kb.cb(Action.MY_GAMES, number),
         footer=[button(texts.BTN_MENU, Action.MENU)],
@@ -359,6 +367,8 @@ def participant_view(game: Game, me: Participant, organizer: str, upgrade: Upgra
             ready = [] if me.gift_ready else [gift_ready_button(game.id)]
             rows.append([button(texts.BTN_EDIT_WISHES, Action.WISHES, game.id), *ready,
                          button(texts.BTN_LEAVE, Action.LEAVE, game.id)])
+    elif game.status == GameStatus.DRAWN and me.status == ParticipantStatus.WAITING:
+        rows.append(button(texts.BTN_LEAVE, Action.LEAVE, game.id))
     if game.organizer_id == me.user_id:
         rows.append(panel_button(game.id))
     rows.append(ref_button(game))
@@ -525,11 +535,19 @@ def join_notice(game: Game, names: Sequence[str], active: int) -> OutMessage:
     return OutMessage(text, kb.keyboard(panel_button(game.id)))
 
 
-def waiting_notice(game: Game, waiting_count: int, upgrade: Upgrade | None) -> OutMessage:
-    """§5.6: people are queued (at most one per hour); ``upgrade`` is None when nobody can pay."""
+def waiting_notice(
+    game: Game, waiting_count: int, upgrade: Upgrade | None, *, contact_email: str | None = None
+) -> OutMessage:
+    """§5.6: people are queued (at most one per hour); ``upgrade`` is None when nobody can pay.
+
+    ``contact_email`` is set at the top tier, where a bigger game is arranged by e-mail (§4).
+    """
     if upgrade is None:
-        return OutMessage(texts.waiting_notice_full(title=game.title, waiting=waiting_count),
-                          kb.keyboard(panel_button(game.id)))
+        text = texts.waiting_notice_full(title=game.title, waiting=waiting_count)
+        if contact_email is not None:
+            contact = texts.upgrade_contact_us(max_limit=game.participant_limit, support_email=contact_email)
+            text = f"{text} {contact}"
+        return OutMessage(text, kb.keyboard(panel_button(game.id)))
     text = texts.waiting_notice(title=game.title, waiting=waiting_count, limit=upgrade.limit, price=upgrade.amount)
     return OutMessage(text, kb.keyboard(upgrade_button(game.id)))
 
@@ -558,26 +576,35 @@ def wish_reminder(game: Game) -> OutMessage:
 
 def draw_result(game: Game, receiver: Participant, *, redraw: bool = False) -> OutMessage:
     text = texts.draw_result(title=game.title, receiver=receiver.display_name, wishes=receiver.wishes,
-                             budget=game.budget_text, exchange_date=game.exchange_date, redraw=redraw)
+                             budget=game.budget_text, exchange_date=game.exchange_date, anon_chat=game.anon_chat,
+                             redraw=redraw)
     return OutMessage(text, kb.keyboard(relay_buttons(game), gift_ready_button(game.id), ref_button(game)))
 
 
 def confirm_redraw(game: Game) -> OutMessage:
     return OutMessage(
         texts.confirm_redraw(title=game.title, left=MAX_REDRAWS - game.redraw_count),
-        kb.keyboard([button(texts.BTN_CONFIRM_REDRAW, Action.REDRAW_CONFIRM, game.id),
+        kb.keyboard([button(texts.BTN_CONFIRM_REDRAW, Action.REDRAW_CONFIRM, game.id, game.redraw_count),
                      button(texts.BTN_CANCEL, Action.PANEL, game.id)]),
     )
 
 
 def receiver_left(game: Game, receiver: Participant) -> OutMessage:
     """P1: the giver's receiver left after the draw; the giver now gifts the leaver's receiver."""
-    return OutMessage(texts.receiver_left(receiver=receiver.display_name, wishes=receiver.wishes),
+    return OutMessage(texts.receiver_left(receiver=receiver.display_name, wishes=receiver.wishes,
+                                          anon_chat=game.anon_chat),
                       kb.keyboard(relay_buttons(game)))
 
 
-def splice_needs_redraw(game: Game) -> OutMessage:
-    return OutMessage(texts.splice_needs_redraw(game.title), kb.keyboard(panel_button(game.id)))
+def splice_problem(game: Game, *, too_few: bool) -> OutMessage:
+    """After a splice the pairs need the organizer: a redraw, or (when none is possible) another way out."""
+    if too_few:
+        text = texts.splice_too_few(game.title)
+    elif game.redraw_count >= MAX_REDRAWS:
+        text = texts.splice_no_redraws_left(game.title)
+    else:
+        text = texts.splice_needs_redraw(game.title)
+    return OutMessage(text, kb.keyboard(panel_button(game.id)))
 
 
 # --- §5.11 reveal ---------------------------------------------------------------------------------------
@@ -622,7 +649,8 @@ def group_card(config: Config, game: Game, names: Sequence[str]) -> OutMessage:
 
 
 def whom_do_i_gift(game: Game, receiver: Participant) -> OutMessage:
-    text = texts.whom_do_i_gift(title=game.title, receiver=receiver.display_name, wishes=receiver.wishes)
+    text = texts.whom_do_i_gift(title=game.title, receiver=receiver.display_name, wishes=receiver.wishes,
+                                anon_chat=game.anon_chat)
     rows: list[Sequence[Button] | Button] = []
     if game.status == GameStatus.DRAWN:
         rows.append(relay_buttons(game))
@@ -651,7 +679,8 @@ def report_to_admins(report: Report, code: str | None) -> OutMessage:
         texts.report_to_admin(report_id=report.id, code=code, reporter_id=report.reporter_id,
                               reported_id=report.reported_id, text=report.text),
         kb.keyboard([button(texts.BTN_BLOCK_SENDER, Action.BLOCK_REPORTED, report.id),
-                     button(texts.BTN_CLOSE_REPORT, Action.CLOSE_REPORT, report.id)]),
+                     button(texts.BTN_CLOSE_REPORT, Action.CLOSE_REPORT, report.id)],
+                    button(texts.BTN_CLEAR_REPORTED, Action.ADMIN_CLEAR_REPORTED, report.id)),
     )
 
 
@@ -663,7 +692,8 @@ def unblock_button(user_id: int) -> kb.CallbackButton:
 
 
 def admin_game(game: Game, counts: GameCounts, payments: Sequence[Payment]) -> OutMessage:
-    """/game CODE: the summary (never wishes or messages) with [Выдать S/M/L] [Отменить игру]."""
+    """/game CODE: the summary (never wishes or messages) with [Выдать S/M/L] [Отменить игру]
+    and [Сбросить название] for a title that must go (moderation, §11)."""
     text = texts.admin_game_summary(
         code=game.code, title=game.title, status=game.status, tier=game.tier, active=counts.active,
         limit=game.participant_limit, waiting=counts.waiting, organizer_id=game.organizer_id,
@@ -675,7 +705,14 @@ def admin_game(game: Game, counts: GameCounts, payments: Sequence[Payment]) -> O
         rows.append([button(texts.btn_grant(tier), Action.ADMIN_GRANT, game.id, tier) for tier in PAID_TIERS])
     if game.status in (GameStatus.COLLECTING, GameStatus.DRAWN):
         rows.append(button(texts.BTN_ADMIN_CANCEL_GAME, Action.ADMIN_CANCEL, game.id))
+    if game.title != texts.DEFAULT_TITLE:
+        rows.append(button(texts.BTN_RESET_TITLE, Action.ADMIN_RESET_TITLE, game.id))
     return OutMessage(text, kb.keyboard(*rows) if rows else None)
+
+
+def confirm_forget(user_id: int) -> OutMessage:
+    return OutMessage(texts.confirm_forget(user_id),
+                      kb.keyboard(button(texts.BTN_CONFIRM_FORGET, Action.ADMIN_FORGET_CONFIRM, user_id)))
 
 
 def confirm_admin_cancel(game: Game) -> OutMessage:

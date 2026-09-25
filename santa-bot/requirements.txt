@@ -2,3 +2,16 @@ aiohttp==3.14.3
 aiosqlite==0.22.1
 jinja2==3.1.6
 certifi==2026.7.22
+# The time zone database for Windows (Linux and the Docker image have their own).
+tzdata==2026.4
+# Pulled in by the packages above; pinned so a rebuild installs exactly the tested set.
+aiohappyeyeballs==2.7.1
+aiosignal==1.4.0
+attrs==26.1.0
+frozenlist==1.8.0
+idna==3.20
+MarkupSafe==3.0.3
+multidict==6.9.1
+propcache==0.5.4
+typing_extensions==4.16.0
+yarl==1.25.1

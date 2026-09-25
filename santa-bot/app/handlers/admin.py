@@ -3,6 +3,10 @@
 Admin-only commands are invisible to everyone else (they get the usual 'I don't
 understand' reply) and work before consent. Replies never show wishes or
 anonymous messages. Grants and cancellations take the game lock, like payments.
+
+Deletion and moderation (§11, the privacy policy): /forget USERID deletes a person's
+data on request; /clean CODE USERID and the report's [Стереть тексты отправителя]
+remove what someone wrote in a game; /game's [Сбросить название] removes a title.
 """
 
 from __future__ import annotations
@@ -211,7 +215,67 @@ async def _set_unblocked(s: Session, user_id: int) -> None:
     await s.say(texts.user_unblocked(user_id))
 
 
-def _user_id(raw: str) -> int:
+def _user_id(raw: str, usage: str = texts.BLOCK_USAGE) -> int:
     if not raw.isdigit():
-        raise Refusal(texts.BLOCK_USAGE)
+        raise Refusal(usage)
     return int(raw)
+
+
+# --- deletion on request and moderation (§11) ------------------------------------------------------------
+
+
+@command("/forget", admin_only=True)
+async def _forget(s: Session, rest: str) -> None:
+    user_id = _user_id(rest, texts.FORGET_USAGE)
+    if await repo.get_user(s.db, user_id) is None:
+        raise Refusal(texts.USER_NOT_FOUND)
+    await s.say(views.confirm_forget(user_id))
+
+
+@on(Action.ADMIN_FORGET_CONFIRM, admin_only=True)
+async def _forget_confirm(s: Session, args: Args) -> None:
+    user_id = args.number(0)
+    erasure = await games.forget_user(s.db, user_id, s.now())
+    if erasure is None:
+        raise Refusal(texts.USER_NOT_FOUND)
+    for game, people in erasure.cancelled:
+        await notices.game_cancelled(s.ctx, game, people)
+        await group.card_erased(s.ctx, game)
+    for game, departure in erasure.departures:
+        await notices.departed(s.ctx, game, departure)
+        await group.card_changed(s.ctx, game.id)
+    await s.say(texts.user_forgotten(user_id=user_id, cancelled=len(erasure.cancelled),
+                                     left=len(erasure.departures)))
+
+
+@command("/clean", admin_only=True)
+async def _clean(s: Session, rest: str) -> None:
+    parts = rest.split()
+    if len(parts) != 2:
+        raise Refusal(texts.CLEAN_USAGE)
+    game = await _game_by_code(s, parts[0], texts.CLEAN_USAGE)
+    await _clear_texts(s, game, _user_id(parts[1], texts.CLEAN_USAGE))
+
+
+@on(Action.ADMIN_CLEAR_REPORTED, admin_only=True)
+async def _clear_reported(s: Session, args: Args) -> None:
+    report = await repo.get_report(s.db, args.number(0))
+    game = None if report is None or report.game_id is None else await repo.get_game(s.db, report.game_id)
+    if report is None or game is None:
+        raise Outdated("no such report or game")
+    await _clear_texts(s, game, report.reported_id)
+
+
+async def _clear_texts(s: Session, game: Game, user_id: int) -> None:
+    if await games.clear_texts(s.db, game.id, user_id) is None:
+        raise Refusal(texts.NOT_IN_THAT_GAME)
+    await s.say(texts.texts_cleared(user_id=user_id, code=game.code))
+    await group.card_changed(s.ctx, game.id)
+
+
+@on(Action.ADMIN_RESET_TITLE, admin_only=True)
+async def _reset_title(s: Session, args: Args) -> None:
+    game = await _admin_game(s, args.number(0))
+    await repo.update_game(s.db, game.id, title=texts.DEFAULT_TITLE)
+    await s.say(texts.title_reset(game.code))
+    await group.card_changed(s.ctx, game.id)

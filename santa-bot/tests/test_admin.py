@@ -82,7 +82,8 @@ async def test_game_summary_grant_button_and_queue(bot: Bot, api: FakeMaxApi, cl
     assert summary.startswith(f"Игра {game.code} · «Отдел продаж»\nСтатус: идёт набор · тариф free\n"
                               "Участников: 10 из 10, в очереди 1\nОрганизатор: 100")
     assert summary.endswith("Платежей нет.")
-    assert admin.button_texts == ["Выдать S", "Выдать M", "Выдать L", texts.BTN_ADMIN_CANCEL_GAME]
+    assert admin.button_texts == ["Выдать S", "Выдать M", "Выдать L", texts.BTN_ADMIN_CANCEL_GAME,
+                                  texts.BTN_RESET_TITLE]
 
     await bot(admin.press("Выдать S"))
     await bot.drain()
@@ -140,7 +141,8 @@ async def test_admin_cancels_a_game_after_confirmation(bot: Bot, api: FakeMaxApi
     await bot(admin.press(texts.BTN_CONFIRM_CANCEL_GAME))
     assert admin.last_text == texts.ADMIN_GAME_CLOSED
     await bot(admin.say(f"/game {game.code}"))
-    assert api.last_to(ADMIN_ID).buttons == [], "a cancelled game has nothing to grant or cancel"
+    buttons = [b.text for b in api.last_to(ADMIN_ID).buttons]
+    assert buttons == [texts.BTN_RESET_TITLE], "a cancelled game has nothing to grant or cancel"
 
 
 async def test_refund_marks_only_paid_payments(bot: Bot, clock: FakeClock, admin: FakeUser) -> None:
@@ -223,3 +225,75 @@ async def test_maintenance_refuses_new_games_and_joins(bot: Bot, admin: FakeUser
     assert await repo.get_participant(bot.ctx.db, game.id, 601) is not None
     await bot(admin.say("/maintenance"))
     assert admin.last_text == texts.MAINTENANCE_USAGE
+
+
+# --- deletion on request and moderation (§11) --------------------------------------------------------------
+
+
+async def personal_rows(bot: Bot, user_id: int) -> int:
+    queries = (
+        "SELECT COUNT(*) FROM users WHERE user_id = ?",
+        "SELECT COUNT(*) FROM participants WHERE user_id = ?",
+        "SELECT COUNT(*) FROM games WHERE organizer_id = ?",
+        "SELECT COUNT(*) FROM payments WHERE payer_id = ?",
+        "SELECT COUNT(*) FROM events WHERE user_id = ?",
+    )
+    return sum([int(await bot.ctx.db.fetchval(query, (user_id,))) for query in queries])
+
+
+async def test_forget_deletes_a_participant_and_the_queue_moves_up(
+    bot: Bot, api: FakeMaxApi, clock: FakeClock, admin: FakeUser
+) -> None:
+    game, dmitry = await full_game(bot, clock)
+    await pay_click(bot, dmitry, game)
+    await bot(admin.say("/forget 201"))
+    assert admin.last_text == texts.confirm_forget(201)
+    assert await personal_rows(bot, 201) > 0, "nothing happens before the confirmation"
+    await bot(admin.press(texts.BTN_CONFIRM_FORGET))
+    assert admin.last_text == texts.user_forgotten(user_id=201, cancelled=0, left=1)
+    assert await personal_rows(bot, 201) == 0
+    await bot.drain()
+    assert await status_in(bot.ctx, game, dmitry.user_id) == ParticipantStatus.ACTIVE
+
+    await bot(admin.say(f"/forget {dmitry.user_id}"))
+    await bot(admin.press(texts.BTN_CONFIRM_FORGET))
+    assert await personal_rows(bot, dmitry.user_id) == 0
+    payments = await repo.payments_of_game(bot.ctx.db, game.id)
+    assert [p.payer_id for p in payments] == [None], "the payment stays for the accounts, without the payer"
+    await bot(admin.press(texts.BTN_CONFIRM_FORGET))
+    assert admin.last_text == texts.USER_NOT_FOUND
+
+
+async def test_forget_an_organizer_cancels_and_deletes_their_games(
+    bot: Bot, api: FakeMaxApi, clock: FakeClock, admin: FakeUser
+) -> None:
+    game, dmitry = await full_game(bot, clock)
+    await bot(admin.say(f"/forget {ORGANIZER}"))
+    await bot(admin.press(texts.BTN_CONFIRM_FORGET))
+    assert admin.last_text == texts.user_forgotten(user_id=ORGANIZER, cancelled=1, left=0)
+    await bot.drain()
+    for user_id in (201, 209, dmitry.user_id):
+        assert api.last_text(user_id) == texts.game_cancelled("Отдел продаж")
+    assert await repo.get_game(bot.ctx.db, game.id) is None
+    assert await personal_rows(bot, ORGANIZER) == 0
+    assert await repo.get_user(bot.ctx.db, 201) is not None, "the others keep their accounts"
+
+
+async def test_clean_removes_what_someone_wrote_and_the_title_can_be_reset(
+    bot: Bot, clock: FakeClock, admin: FakeUser
+) -> None:
+    game, _ = await full_game(bot, clock)
+    await repo.set_wishes(bot.ctx.db, game.id, 201, "что-то грубое")
+    await bot(admin.say(f"/clean {game.code} 201"))
+    assert admin.last_text == texts.texts_cleared(user_id=201, code=game.code)
+    cleared = await repo.get_participant(bot.ctx.db, game.id, 201)
+    assert cleared is not None and (cleared.display_name, cleared.wishes) == ("Участник", None)
+    await bot(admin.say(f"/clean {game.code} 999"))
+    assert admin.last_text == texts.NOT_IN_THAT_GAME
+    await bot(admin.say("/clean 201"))
+    assert admin.last_text == texts.CLEAN_USAGE
+
+    await bot(admin.say(f"/game {game.code}"))
+    await bot(admin.press(texts.BTN_RESET_TITLE))
+    assert admin.last_text == texts.title_reset(game.code)
+    assert (await bot.game(game.id)).title == texts.DEFAULT_TITLE

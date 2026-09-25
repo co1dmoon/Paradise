@@ -148,11 +148,3 @@ class DrawCounter:
             self._expires = now + COUNTER_TTL
         return self._value if self._value >= COUNTER_MIN else None
 
-
-def plural(n: int, one: str, few: str, many: str) -> str:
-    """Russian plural form: 1 жеребьёвка, 2 жеребьёвки, 5 жеребьёвок."""
-    if n % 10 == 1 and n % 100 != 11:
-        return one
-    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
-        return few
-    return many

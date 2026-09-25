@@ -20,6 +20,7 @@ import jinja2
 from aiohttp import web
 
 from app.context import CTX_KEY, AppContext
+from app.core import texts
 from app.core.clock import to_iso
 from app.payments import robokassa
 from app.updates import process_update
@@ -89,7 +90,7 @@ async def landing(request: web.Request) -> web.Response:
         request, "index.html",
         open_bot_url=pages.landing_bot_link(ctx.config, src),
         draws=draws,
-        draws_word=pages.plural(draws or 0, "жеребьёвка", "жеребьёвки", "жеребьёвок"),
+        draws_word=texts.plural(draws or 0, "жеребьёвка", "жеребьёвки", "жеребьёвок"),
         example_text=pages.example_result(),
         example_buttons=pages.example_buttons(),
     )
@@ -192,6 +193,7 @@ async def healthz(request: web.Request) -> web.Response:
         "webhook_registered": ctx.runtime.webhook_registered,
         "bot_enabled": ctx.config.bot_enabled,
         "payments_enabled": ctx.config.payments_enabled,
+        "payments_test_mode": ctx.config.payments_enabled and ctx.config.robokassa_test,
     }
     return web.json_response(report, status=200 if db_ok else 503, headers={"Cache-Control": "no-store"})
 

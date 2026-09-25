@@ -11,13 +11,16 @@ import pytest
 from app import repo
 from app.config import Config, load_config
 from app.context import AppContext
-from app.core import texts
+from app.core import billing, texts
 from app.core.clock import FakeClock
 from app.core.models import GameStatus, ParticipantStatus, PaymentStatus, Tier
+from app.handlers.views import Action
 from app.main import build_context
 from app.payments import robokassa
 from tests.bot import ADMIN_ID, Bot
 from tests.site import (
+    ORGANIZER,
+    fill,
     full_game_with_waiting,
     pay_click,
     payment_of,
@@ -252,6 +255,39 @@ async def test_payment_after_the_draw_is_recorded_and_alerted(bot: Bot, api: Fak
     await bot.drain()
     assert texts.payment_after_draw(code=game.code, inv_id=payment.inv_id) in api.texts_to(ADMIN_ID)
     assert (await payment_of(bot.ctx, payment.inv_id)).status == PaymentStatus.PAID
+    email = bot.ctx.config.support_email
+    assert api.last_text(late.user_id) == texts.payment_too_late(title=game.title, amount=490, support_email=email)
+    assert not any("оплатил(а)" in text for text in api.texts_to(ORGANIZER))
+    assert (await bot.game(game.id)).participant_limit == 10, "a drawn game is not enlarged"
+
+    await bot.forge(late, f"{Action.OPEN_GAME}:{game.id}")
+    assert "я напишу" not in late.screen_text
+    await bot(late.press(texts.BTN_LEAVE))
+    assert late.screen_text == texts.confirm_leave(game.title)
+    await bot(late.press(texts.BTN_CONFIRM_LEAVE))
+    assert await status_in(bot.ctx, game, late.user_id) == ParticipantStatus.LEFT
+
+
+async def test_an_older_link_paid_after_another_upgrade_is_flagged_for_a_refund(
+    bot: Bot, api: FakeMaxApi, clock: FakeClock
+) -> None:
+    """The organizer opens «до 100 — 990 ₽», a waiting person pays 490 ₽ for S, then the organizer pays."""
+    late = bot.person(250, "Опоздавший")
+    game = await full_game_with_waiting(bot, clock, late)
+    olga = bot.person(ORGANIZER, "Ольга")
+    await bot(olga.press(texts.BTN_PANEL))
+    await bot(olga.press(texts.BTN_UPGRADE))
+    await bot(olga.press(texts.btn_tier(100, 990)))
+    to_m = next(p for p in await repo.payments_of_game(bot.ctx.db, game.id) if p.payer_id == ORGANIZER)
+    to_s = await pay_click(bot, late, game)
+    async with site_client(bot.ctx) as client:
+        for payment in (to_s, to_m):
+            assert (await client.post(RESULT, data=result_form(payment))).status == 200
+    await bot.drain()
+    alert = texts.overpayment(code=game.code, inv_id=to_m.inv_id, amount=990, excess=490)
+    assert alert in api.texts_to(ADMIN_ID)
+    assert (await bot.game(game.id)).participant_limit == 100
+    assert "490 ₽ мы вернём" in api.last_text(ORGANIZER)
 
 
 async def test_notice_after_a_refund_changes_nothing(bot: Bot, clock: FakeClock) -> None:
@@ -264,3 +300,13 @@ async def test_notice_after_a_refund_changes_nothing(bot: Bot, clock: FakeClock)
         assert (response.status, await response.text()) == (200, f"OK{payment.inv_id}")
     assert (await payment_of(bot.ctx, payment.inv_id)).status == PaymentStatus.REFUNDED
     assert (await bot.game(game.id)).tier == Tier.FREE
+
+
+async def test_a_full_paid_game_does_not_call_itself_free(bot: Bot, api: FakeMaxApi, clock: FakeClock) -> None:
+    game = await full_game_with_waiting(bot, clock)
+    await billing.grant_tier(bot.ctx.db, game.id, Tier.S, 490, await bot.ctx.prices(), clock.now())
+    await fill(bot, clock, game, range(210, 230))
+    newcomer = bot.person(260, "Новенький")
+    await bot.join(newcomer, game, wishes=None)
+    assert await status_in(bot.ctx, game, newcomer.user_id) == ParticipantStatus.WAITING
+    assert api.last_text(newcomer.user_id) == texts.waiting_list(free=False, current_limit=30, limit=100, price=500)

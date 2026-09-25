@@ -24,6 +24,7 @@ from app.max_api import (
     Unauthorized,
     classify_error,
     dedupe_key,
+    UPDATE_TYPES,
     ensure_subscription,
     parse_update,
     update_user_id,
@@ -188,8 +189,16 @@ async def test_subscriptions_and_updates(server: tuple[Recorder, HttpMaxApi]) ->
     assert subscribe["route"] == "POST /subscriptions"
     assert subscribe["body"]["secret"] == "sec-ret" and "message_callback" in subscribe["body"]["update_types"]
     recorder.reply("GET /subscriptions", 200, {"subscriptions": [
-        {"url": "https://santa.example.ru/max/webhook/x", "time": 1, "update_types": ["bot_started"]}]})
+        {"url": "https://santa.example.ru/max/webhook/x", "time": 1, "update_types": list(UPDATE_TYPES)},
+        {"url": "https://old.example.ru/max/webhook/y", "time": 1, "update_types": list(UPDATE_TYPES)}]})
     assert await ensure_subscription(api, "https://santa.example.ru/max/webhook/x", "sec-ret") is False
+    unsubscribe = recorder.requests[-1]
+    assert unsubscribe["route"] == "DELETE /subscriptions"
+    assert unsubscribe["query"] == {"url": "https://old.example.ru/max/webhook/y"}
+    recorder.reply("GET /subscriptions", 200, {"subscriptions": [
+        {"url": "https://santa.example.ru/max/webhook/x", "time": 1, "update_types": list(UPDATE_TYPES)}]})
+    assert await ensure_subscription(api, "https://santa.example.ru/max/webhook/x", "sec-ret", refresh=True) is False
+    assert recorder.requests[-1]["route"] == "POST /subscriptions", "a refresh posts the current secret"
     recorder.reply("GET /updates", 200, {"updates": [{"update_type": "bot_started"}, "junk"], "marker": 7})
     page = await api.get_updates(None, 30)
     assert page.marker == 7 and len(page.updates) == 1

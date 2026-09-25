@@ -17,8 +17,8 @@ from app.core import texts
 from app.core.clock import FakeClock
 from app.core.dates import in_season_window
 from app.core.models import Game, GameStatus
-from app.handlers import views
-from app.max_api import Unauthorized
+from app.handlers import notices, views
+from app.max_api import UPDATE_TYPES, BadRequest, Transient, Unauthorized
 from app.scheduler import DailyAt, Every, Job, Scheduler, jobs_for
 from tests.bot import ADMIN_ID, Bot
 from tests.site import full_game_with_waiting
@@ -173,6 +173,21 @@ async def test_waiting_notice_without_a_paid_tier(bot: Bot) -> None:
     assert notice.keyboard is not None and [b.text for b in notice.keyboard.buttons()] == [texts.BTN_PANEL]
 
 
+
+async def test_waiting_notice_at_the_top_tier_names_the_support_email(bot: Bot, api: FakeMaxApi) -> None:
+    """§4: more than the top tier is arranged by e-mail; the organizer must learn how."""
+    _, game = await organizer_game(bot, "Офис")
+    top = dataclasses.replace(game, participant_limit=300)
+    async with bot.ctx.db.transaction() as tx:
+        await notices.waiting_notice(bot.ctx, top, 4, None, db=tx)
+    await bot.drain()
+    email = bot.ctx.config.support_email
+    assert api.last_text(ORGANIZER) == (
+        "В игру «Офис» хотят вступить ещё 4 чел., но мест нет. "
+        + texts.upgrade_contact_us(max_limit=300, support_email=email)
+    )
+
+
 # --- §5.9 b, c ------------------------------------------------------------------------------------------------
 
 
@@ -247,6 +262,12 @@ async def test_backup_writes_a_readable_copy_and_keeps_14(ctx: AppContext, confi
         assert copy.execute("PRAGMA journal_mode").fetchone() == ("delete",)
         assert copy.execute("SELECT value FROM settings WHERE key = 'marker'").fetchone() == ("x",)
 
+    await ctx.db.execute("UPDATE settings SET value = 'restored' WHERE key = 'marker'")
+    await jobs.backup_database(ctx)
+    with contextlib.closing(sqlite3.connect(path)) as copy:
+        assert copy.execute("SELECT value FROM settings WHERE key = 'marker'").fetchone() == ("x",), (
+            "a made-up run after a restore never replaces the copy taken earlier that day")
+
     for day in range(1, 17):
         (config.backups_dir / backup.backup_name(date(2026, 10, day))).write_bytes(b"")
     (config.backups_dir / "notes.txt").write_text("не трогать")
@@ -260,7 +281,7 @@ async def test_backup_writes_a_readable_copy_and_keeps_14(ctx: AppContext, confi
 async def test_webhook_watchdog_restores_a_lost_subscription(
     ctx: AppContext, api: FakeMaxApi, config: Config
 ) -> None:
-    await jobs.webhook_watchdog(ctx)
+    await jobs.sync_webhook(ctx, startup=True)
     assert [s.url for s in api.subscriptions] == [config.webhook_url] and ctx.runtime.webhook_registered
     await jobs.webhook_watchdog(ctx)
     api.subscriptions.clear()
@@ -268,6 +289,61 @@ async def test_webhook_watchdog_restores_a_lost_subscription(
     await ctx.outbox.drain()
     assert api.texts_to(ADMIN_ID) == [texts.WEBHOOK_RESTORED]
     assert [s.url for s in api.subscriptions] == [config.webhook_url]
+
+
+async def test_startup_sends_the_current_secret_and_drops_old_addresses(
+    ctx: AppContext, api: FakeMaxApi, config: Config
+) -> None:
+    """GET /subscriptions never shows the secret, so a changed MAX_WEBHOOK_SECRET is always posted."""
+    old_address = "https://old.example.ru/max/webhook/oldpathsecret0123456789ab"
+    await api.subscribe(config.webhook_url, ("message_created",), "an-old-secret")
+    await api.subscribe(old_address, UPDATE_TYPES, "an-old-secret")
+    await jobs.sync_webhook(ctx, startup=True)
+    assert [s.url for s in api.subscriptions] == [config.webhook_url]
+    assert api.subscriptions[0].update_types == UPDATE_TYPES
+    assert api.subscription_secrets[config.webhook_url] == config.max_webhook_secret
+    await ctx.outbox.drain()
+    assert api.texts_to(ADMIN_ID) == []
+
+
+async def test_watchdog_puts_back_changed_update_types(ctx: AppContext, api: FakeMaxApi, config: Config) -> None:
+    await jobs.sync_webhook(ctx, startup=True)
+    await api.subscribe(config.webhook_url, ("message_created",), config.max_webhook_secret)
+    await jobs.webhook_watchdog(ctx)
+    assert api.subscriptions[0].update_types == UPDATE_TYPES
+
+
+async def test_a_failed_subscription_alerts_the_admins_until_it_works(
+    ctx: AppContext, api: FakeMaxApi, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    subscribe = api.subscribe
+
+    async def rejected(url: str, types: object, secret: str) -> None:
+        raise BadRequest(400, "url is not reachable")
+
+    monkeypatch.setattr(api, "subscribe", rejected)
+    await jobs.sync_webhook(ctx, startup=True)
+    await jobs.webhook_watchdog(ctx)
+    assert not ctx.runtime.webhook_registered
+    monkeypatch.setattr(api, "subscribe", subscribe)
+    await jobs.webhook_watchdog(ctx)
+    assert ctx.runtime.webhook_registered
+    await ctx.outbox.drain()
+    assert api.texts_to(ADMIN_ID) == [texts.webhook_failed("url is not reachable"), texts.WEBHOOK_RESTORED]
+
+
+async def test_a_passing_network_error_while_the_webhook_works_is_only_logged(
+    ctx: AppContext, api: FakeMaxApi, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await jobs.sync_webhook(ctx, startup=True)
+
+    async def timeout() -> list[object]:
+        raise Transient(0, "timeout on GET /subscriptions")
+
+    monkeypatch.setattr(api, "list_subscriptions", timeout)
+    await jobs.webhook_watchdog(ctx)
+    await ctx.outbox.drain()
+    assert ctx.runtime.webhook_registered and api.texts_to(ADMIN_ID) == []
 
 
 async def test_rejected_token_alerts_the_admins(
@@ -292,7 +368,8 @@ async def test_certificate_expiry_is_announced_30_days_ahead(
     await ctx.outbox.drain()
     assert api.texts_to(ADMIN_ID) == [
         "Сертификат Russian Trusted Sub CA истекает 6 марта 2027 (через 24 дн.). "
-        "Скачайте новый с gu-st.ru, положите в certs/ и пересоберите бота."
+        "Скачайте новый с gu-st.ru, сохраните его как certs/russian_trusted_sub_ca.pem вместо старого "
+        "(имя файла должно заканчиваться на .pem) и пересоберите бота — README, раздел 10."
     ]
 
 

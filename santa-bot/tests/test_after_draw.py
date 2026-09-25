@@ -75,6 +75,35 @@ async def test_redraw_replaces_undelivered_pairs_twice_at_most(bot: Bot, api: Fa
     assert report.blocks[0][1].draws == 1, "redraws are not new draws"
 
 
+async def test_a_second_tap_on_one_redraw_confirmation_changes_nothing(
+    bot: Bot, api: FakeMaxApi, clock: FakeClock, party
+) -> None:
+    people, game = party
+    olga = people[ORGANIZER]
+    await bot(olga.press(texts.BTN_PANEL))
+    await bot(olga.press(texts.BTN_REDRAW))
+    stale = olga.press(texts.BTN_CONFIRM_REDRAW)
+    await bot(olga.press(texts.BTN_CONFIRM_REDRAW))
+    await bot.drain()
+    pairs = await repo.assignments(bot.ctx.db, game.id)
+
+    clock.advance(3600)
+    await bot(stale)
+    await bot.drain()
+    assert olga.last_text == texts.REDRAW_ALREADY_DONE
+    assert (await bot.game(game.id)).redraw_count == 1
+    assert await repo.assignments(bot.ctx.db, game.id) == pairs
+    assert all(len(results(api, user_id)) == 1 for user_id in NAMES)
+
+
+async def test_gift_ready_is_reset_by_a_redraw(bot: Bot, api: FakeMaxApi, party) -> None:
+    people, game = party
+    await bot.drain()
+    await bot(people[201].press(texts.BTN_GIFT_READY))
+    await redraw(bot, people[ORGANIZER])
+    assert not (await repo.get_participant(bot.ctx.db, game.id, 201)).gift_ready  # type: ignore[union-attr]
+
+
 async def test_replies_to_messages_from_before_a_redraw_are_refused(bot: Bot, api: FakeMaxApi, party) -> None:
     people, game = party
     await bot.drain()
@@ -131,7 +160,9 @@ async def test_leaving_after_the_draw_hands_the_receiver_to_the_santa(bot: Bot, 
     assert not any(t.startswith(texts.splice_needs_redraw("Семья")) for t in api.texts_to(ORGANIZER))
 
 
-async def test_removal_down_to_two_asks_the_organizer_to_redraw(bot: Bot, api: FakeMaxApi, party) -> None:
+async def test_removal_down_to_two_tells_the_organizer_a_redraw_cannot_help(
+    bot: Bot, api: FakeMaxApi, party
+) -> None:
     people, game = party
     await bot.drain()
     olga = people[ORGANIZER]
@@ -145,7 +176,8 @@ async def test_removal_down_to_two_asks_the_organizer_to_redraw(bot: Bot, api: F
     await bot.drain()
     left = await repo.participants(bot.ctx.db, game.id, ParticipantStatus.ACTIVE)
     assert [p.user_id for p in left] == [ORGANIZER, 204]
-    assert texts.splice_needs_redraw("Семья") in api.texts_to(ORGANIZER)
+    assert texts.splice_too_few("Семья") in api.texts_to(ORGANIZER)
+    assert texts.splice_needs_redraw("Семья") not in api.texts_to(ORGANIZER)
     assert api.last_text(201) == texts.removed_notice("Семья")
 
 

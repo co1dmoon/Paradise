@@ -116,6 +116,7 @@ class FakeMaxApi:
         self.answers: list[RecordedAnswer] = []
         self.calls: list[RecordedCall] = []
         self.subscriptions: list[Subscription] = []
+        self.subscription_secrets: dict[str, str] = {}
         self.commands: list[tuple[str, str]] = []
         self.chats: dict[int, ChatInfo] = {}
         self.pending_updates: list[dict[str, Any]] = []
@@ -198,6 +199,11 @@ class FakeMaxApi:
         if not url.startswith("https://"):
             raise BadRequest(400, "url must be https")
         self.subscriptions = [s for s in self.subscriptions if s.url != url] + [Subscription(url, tuple(types))]
+        self.subscription_secrets[url] = secret
+
+    async def unsubscribe(self, url: str) -> None:
+        self.subscriptions = [s for s in self.subscriptions if s.url != url]
+        self.subscription_secrets.pop(url, None)
 
     async def get_updates(self, marker: int | None, timeout: int) -> UpdatesPage:
         """Long polling: an empty page comes back after ``poll_wait`` real seconds, not at once."""

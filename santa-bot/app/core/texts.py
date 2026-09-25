@@ -15,6 +15,7 @@ from datetime import date
 from typing import TYPE_CHECKING
 
 from app.core.dates import DateError, format_date
+from app.core.inputs import shorten
 
 if TYPE_CHECKING:
     from app.core.analytics import StatsBlock, StatsReport
@@ -45,6 +46,15 @@ def date_text(value: date | None) -> str:
 def names_preview(names: Sequence[str], limit: int = 15) -> str:
     shown = ", ".join(names[:limit])
     return f"{shown}…" if len(names) > limit else shown
+
+
+def plural(n: int, one: str, few: str, many: str) -> str:
+    """Russian plural form: 1 жеребьёвка, 2 жеребьёвки, 5 жеребьёвок."""
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
 
 
 def _q(text: str) -> str:
@@ -415,11 +425,14 @@ DRAW_NEEDS_THREE = "Для жеребьёвки нужно минимум 3 уч
 
 
 def draw_confirm(*, active: int, without_wishes: int, waiting: int) -> str:
-    text = f"Провести жеребьёвку для {active} участников? После этого вступить будет нельзя."
+    people = plural(active, "участника", "участников", "участников")
+    text = f"Провести жеребьёвку для {active} {people}? После этого вступить будет нельзя."
     if without_wishes:
-        text += f" У {without_wishes} человек нет пожеланий."
+        text += f" У {without_wishes} {plural(without_wishes, 'человека', 'человек', 'человек')} нет пожеланий."
     if waiting:
-        text += f" В очереди {waiting} человек — они не попадут в игру."
+        queued = plural(waiting, "человек", "человека", "человек")
+        outcome = "он не попадёт" if waiting == 1 else "они не попадут"
+        text += f" В очереди {waiting} {queued} — {outcome} в игру."
     return text
 
 
@@ -428,6 +441,7 @@ DRAW_IMPOSSIBLE = "Не получается учесть все исключе�
 DRAW_STARTED = "Жеребьёвка проведена! Рассылаю пары участникам — сообщу, когда всё дойдёт."
 REDRAW_PREFIX = "Жеребьёвка проведена заново — старую пару не учитывайте."
 REDRAW_LIMIT = "Перезапускать жеребьёвку можно не больше 2 раз."
+REDRAW_ALREADY_DONE = "Жеребьёвку по этому подтверждению уже перезапустили — новые пары разосланы."
 
 
 def confirm_redraw(*, title: str, left: int) -> str:
@@ -444,11 +458,11 @@ REDRAW_IMPOSSIBLE = "Не получается составить новые п�
 
 
 def draw_result(*, title: str, receiver: str, wishes: str | None, budget: str,
-                exchange_date: date | None, redraw: bool = False) -> str:
+                exchange_date: date | None, anon_chat: bool = True, redraw: bool = False) -> str:
     text = (
         f"Жеребьёвка в игре {_q(title)} проведена!\n"
-        f"Вы — Тайный Санта для: {receiver}.\n"
-        f"Пожелания: {wishes or '«не написаны — можно спросить анонимно»'}\n"
+        f"Вы — Тайный Санта для: {receiver.rstrip('.')}.\n"
+        f"Пожелания: {_wishes(wishes, anon_chat)}\n"
         f"Бюджет: {budget}. Обмен: {date_text(exchange_date)}.\n"
         "Никому не говорите, кто вам выпал."
     )
@@ -474,11 +488,8 @@ def draw_summary(*, sent: int, total: int, failed_names: Sequence[str]) -> str:
 BTN_WHOM_DO_I_GIFT = "Кому я дарю?"
 
 
-def whom_do_i_gift(*, title: str, receiver: str, wishes: str | None) -> str:
-    return (
-        f"Игра {_q(title)}. Вы дарите: {receiver}.\n"
-        f"Пожелания: {wishes or '«не написаны — можно спросить анонимно»'}"
-    )
+def whom_do_i_gift(*, title: str, receiver: str, wishes: str | None, anon_chat: bool = True) -> str:
+    return f"Игра {_q(title)}. Вы дарите: {receiver}.\nПожелания: {_wishes(wishes, anon_chat)}"
 
 
 def not_received(names: Sequence[str]) -> str:
@@ -490,11 +501,13 @@ def not_received(names: Sequence[str]) -> str:
     )
 
 
-def receiver_left(*, receiver: str, wishes: str | None) -> str:
-    return (
-        f"Ваш получатель выбыл. Теперь вы дарите: {receiver}.\n"
-        f"Пожелания: {wishes or '«не написаны — можно спросить анонимно»'}"
-    )
+def receiver_left(*, receiver: str, wishes: str | None, anon_chat: bool = True) -> str:
+    return f"Ваш получатель выбыл. Теперь вы дарите: {receiver}.\nПожелания: {_wishes(wishes, anon_chat)}"
+
+
+def _wishes(wishes: str | None, anon_chat: bool) -> str:
+    """The receiver's wishes; without them, point to the anonymous question only when it is on."""
+    return wishes or ("«не написаны — можно спросить анонимно»" if anon_chat else "«не написаны»")
 
 
 def splice_needs_redraw(title: str) -> str:
@@ -504,13 +517,30 @@ def splice_needs_redraw(title: str) -> str:
     )
 
 
+def splice_too_few(title: str) -> str:
+    return (
+        f"В игре {_q(title)} кто-то выбыл после жеребьёвки, и участников осталось меньше трёх — "
+        "обмен так не сложится. Договоритесь о подарках сами или отмените игру в настройках пульта."
+    )
+
+
+def splice_no_redraws_left(title: str) -> str:
+    return (
+        f"В игре {_q(title)} кто-то выбыл после жеребьёвки, и новая пара попала в исключения. "
+        "Перезапустить жеребьёвку больше нельзя — предупредите этих участников сами."
+    )
+
+
 # --- §5.6 free limit, waiting list, payment -----------------------------------------------------
 
 
-def waiting_list(*, free_limit: int, limit: int, price: int) -> str:
+def waiting_list(*, free: bool, current_limit: int, limit: int, price: int) -> str:
+    """§5.6; a game that was already paid for says how many places it has instead of 'бесплатной'."""
+    full = (f"Мест нет: в бесплатной игре до {current_limit} участников." if free
+            else f"Мест нет: все {current_limit} мест в игре заняты.")
     return (
-        f"Мест нет: в бесплатной игре до {free_limit} участников. Я поставил вас в очередь и сообщил "
-        f"организатору. Расширить игру до {limit} человек может любой участник — {price} ₽ один раз."
+        f"{full} Я поставил вас в очередь и сообщил организатору. "
+        f"Расширить игру до {limit} человек может любой участник — {price} ₽ один раз."
     )
 
 
@@ -587,8 +617,42 @@ def double_payment(*, code: str, first_inv: int, second_inv: int) -> str:
 
 def payment_after_draw(*, code: str, inv_id: int) -> str:
     return (
-        f"Оплата InvId {inv_id} пришла, когда игра {code} уже не набирает участников. "
-        "Проверьте и при необходимости верните деньги в кабинете Robokassa."
+        f"Оплата InvId {inv_id} пришла, когда игра {code} уже не набирает участников, — расширение не "
+        f"применено. Верните деньги в кабинете Robokassa и отметьте /refund {inv_id}."
+    )
+
+
+def overpayment(*, code: str, inv_id: int, amount: int, excess: int) -> str:
+    """A link made before another upgrade of the same game was paid later (§4: pay only the difference)."""
+    if excess >= amount:
+        return (
+            f"Лишняя оплата {code}: InvId {inv_id} ({amount} ₽) пришла, когда игра уже была расширена "
+            f"по другой оплате. Верните её в кабинете Robokassa и отметьте /refund {inv_id}."
+        )
+    return (
+        f"Переплата {code}: InvId {inv_id} ({amount} ₽) оплачена по ссылке, выданной до другой оплаты этой "
+        f"игры. Верните {excess} ₽ в кабинете Robokassa (частичный возврат)."
+    )
+
+
+def payment_too_late(*, title: str, amount: int, support_email: str) -> str:
+    return (
+        f"Оплата {amount} ₽ пришла, когда игра {_q(title)} уже не набирала участников, — расширение не "
+        f"понадобилось. Мы вернём деньги; если возврата не будет в течение 10 дней, напишите {support_email}."
+    )
+
+
+def payment_not_needed(*, title: str, limit: int, amount: int, support_email: str) -> str:
+    return (
+        f"Оплата {amount} ₽ получена, но игра {_q(title)} уже расширена до {limit} участников по другой "
+        f"оплате. Мы вернём деньги; если возврата не будет в течение 10 дней, напишите {support_email}."
+    )
+
+
+def partial_refund(*, excess: int, support_email: str) -> str:
+    return (
+        f"Часть игры уже была оплачена раньше, поэтому {excess} ₽ мы вернём; если возврата не будет "
+        f"в течение 10 дней, напишите {support_email}."
     )
 
 
@@ -596,7 +660,7 @@ def payment_after_draw(*, code: str, inv_id: int) -> str:
 
 
 def relay_prompt_to_receiver(receiver: str) -> str:
-    return f"Напишите сообщение для {receiver}. Я передам его без вашего имени (до 500 символов)."
+    return f"Напишите сообщение своему получателю ({receiver}). Я передам его без вашего имени (до 500 символов)."
 
 
 RELAY_PROMPT_TO_SANTA = "Напишите сообщение своему Тайному Санте (до 500 символов). Я передам его."
@@ -640,6 +704,7 @@ def report_to_admin(*, report_id: int, code: str | None, reporter_id: int, repor
 
 BTN_BLOCK_SENDER = "Заблокировать отправителя"
 BTN_CLOSE_REPORT = "Закрыть жалобу"
+BTN_CLEAR_REPORTED = "Стереть тексты отправителя"
 REPORT_CLOSED = "Жалоба закрыта."
 
 # --- §5.8 my games and help -----------------------------------------------------------------------
@@ -670,8 +735,10 @@ def game_view(*, title: str, organizer: str, budget: str, exchange_date: date | 
         f"Вы в игре как: {name}",
         f"Ваши пожелания: {wishes or 'пока не написаны'}",
     ]
-    if waiting:
+    if waiting and status == "collecting":
         lines.append("Вы в очереди: как только появится место, я напишу.")
+    elif waiting and status in ("drawn", "finished"):
+        lines.append("Вы остались в очереди: жеребьёвка прошла без вас.")
     return "\n".join(lines)
 
 
@@ -869,6 +936,34 @@ def user_unblocked(user_id: int) -> str:
 
 
 USER_NOT_FOUND = "Пользователь не найден."
+FORGET_USAGE = "Формат: /forget USERID (id человек узнаёт командой /whoami)"
+CLEAN_USAGE = "Формат: /clean КОД USERID"
+BTN_CONFIRM_FORGET = "Да, удалить всё"
+BTN_RESET_TITLE = "Сбросить название"
+NOT_IN_THAT_GAME = "Этот человек не участвовал в этой игре."
+
+
+def confirm_forget(user_id: int) -> str:
+    return (
+        f"Удалить все данные пользователя {user_id}? Его имя, пожелания, пары, сообщения и жалобы "
+        "пропадут. Игры, которые он организует и которые ещё идут, отменятся (участники получат "
+        "уведомление), а из идущих игр он выйдет. Вернуть данные будет нельзя."
+    )
+
+
+def user_forgotten(*, user_id: int, cancelled: int, left: int) -> str:
+    return (
+        f"Данные пользователя {user_id} удалены. Отменено его игр: {cancelled}, вышел из игр: {left}. "
+        "Если он снова напишет боту, всё начнётся с согласия."
+    )
+
+
+def texts_cleared(*, user_id: int, code: str) -> str:
+    return f"Пожелания, имя и сообщения пользователя {user_id} в игре {code} стёрты."
+
+
+def title_reset(code: str) -> str:
+    return f"Название игры {code} сброшено на «{DEFAULT_TITLE}»."
 BTN_UNBLOCK = "Разблокировать"
 MAINTENANCE_ON = "Режим технических работ включён: новые игры и вступления временно закрыты."
 MAINTENANCE_OFF = "Режим технических работ выключен."
@@ -882,6 +977,8 @@ ADMIN_HELP = (
     "/refund INVID — отметить платёж возвращённым\n"
     "/price — цены; /price S 490, /price free 10, /price limit_S 30 — изменить\n"
     "/block USERID, /unblock USERID — блокировка\n"
+    "/clean КОД USERID — стереть пожелания, имя и сообщения человека в игре\n"
+    "/forget USERID — удалить все данные человека по его просьбе\n"
     "/maintenance on|off — технические работы\n"
     "/whoami — ваш id"
 )
@@ -915,18 +1012,27 @@ def backup_upload_failed(reason: str) -> str:
 
 TOKEN_REJECTED = "Токен бота не принят — проверьте MAX_BOT_TOKEN"
 WEBHOOK_RESTORED = "Подписка вебхука была потеряна и восстановлена"
+WEBHOOK_WORKS = "Подписка вебхука оформлена — бот снова получает сообщения."
+
+
+def webhook_failed(detail: str) -> str:
+    return (
+        f"Не удалось подписать бота на сообщения MAX: {shorten(detail, 200)}. Пока это так, бот ничего "
+        "не получает. Проверьте, что сайт открывается по https (README, раздел 11); я пробую снова "
+        "каждые 10 минут."
+    )
 
 
 def username_mismatch(*, actual: str, configured: str) -> str:
     return f"Имя бота в MAX — {actual}, а в настройках MAX_BOT_USERNAME={configured}. Ссылки не будут работать."
 
 
-def certificate_expiring(*, name: str, expires: date, days: int) -> str:
+def certificate_expiring(*, name: str, file: str, expires: date, days: int) -> str:
     when = f"{format_date(expires)} {expires.year}"
     status = f"истекает {when} (через {days} дн.)" if days > 0 else f"истёк {when}"
     return (
-        f"Сертификат {name} {status}. "
-        "Скачайте новый с gu-st.ru, положите в certs/ и пересоберите бота."
+        f"Сертификат {name} {status}. Скачайте новый с gu-st.ru, сохраните его как certs/{file} "
+        "вместо старого (имя файла должно заканчиваться на .pem) и пересоберите бота — README, раздел 10."
     )
 
 

@@ -10,11 +10,11 @@ import pytest
 from app import repo
 from app.context import AppContext
 from app.core import games
-from app.core.clock import FakeClock
+from app.core.clock import FakeClock, to_iso
 from app.core.games import GameDraft
 from app.core.models import JoinVia
 from app.db import Database
-from app.max_api import BadRequest, OutMessage, RateLimited, Target, Transient
+from app.max_api import BadRequest, OutMessage, RateLimited, Target, Transient, Unauthorized
 from app.outbox import PURPOSE_DRAW_RESULT, RETRY_DELAYS, Outbox, RateLimiter
 from tests.helpers import consented_user
 from tools.fake_max import FakeMaxApi
@@ -167,3 +167,28 @@ async def test_draw_results_are_tracked_and_summarized(ctx: AppContext, api: Fak
     assert "Мария" in api.last_text(100)
     participant = await repo.get_participant(ctx.db, game.id, 2)
     assert participant is not None and participant.result_dm_ok is False
+
+
+async def test_a_rejected_token_never_kills_queued_messages(ctx: AppContext, api: FakeMaxApi, clock) -> None:
+    """Fixing MAX_BOT_TOKEN takes the owner longer than the retry schedule; nothing may be lost meanwhile."""
+    await ctx.outbox.enqueue(Target.user(5), OutMessage("Ваша пара"))
+    api.fail_next(Unauthorized(401, "invalid token"), times=30)
+    start = clock.monotonic()
+    await ctx.outbox.drain()
+    assert clock.monotonic() - start > 3 * sum(RETRY_DELAYS), "the rows outlived the retry schedule"
+    assert await ctx.db.fetchval("SELECT COUNT(*) FROM outbox WHERE status = 'dead'") == 0
+    assert "Ваша пара" in api.texts_to(5)
+
+
+async def test_messages_waiting_for_the_token_go_out_once_it_works(
+    ctx: AppContext, api: FakeMaxApi, clock: FakeClock
+) -> None:
+    await ctx.outbox.enqueue(Target.user(5), OutMessage("Ваша пара"))
+    api.fail_next(Unauthorized(401, "invalid token"))
+    await ctx.outbox.run_once()
+    row = await ctx.db.fetchone("SELECT status, attempts, not_before FROM outbox WHERE target_id = 5")
+    assert (row["status"], row["attempts"]) == ("pending", 0) and row["not_before"] > to_iso(clock.now())
+    assert await ctx.outbox.retry_unauthorized_now() == 1
+    clock.advance(1)  # the per-dialog limit, not the retry delay
+    await ctx.outbox.run_once()
+    assert api.texts_to(5) == ["Ваша пара"]

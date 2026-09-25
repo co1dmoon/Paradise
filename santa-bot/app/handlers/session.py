@@ -145,6 +145,7 @@ _REFUSALS: dict[type[GameError], str] = {
     games.NotEnoughParticipants: texts.DRAW_NEEDS_THREE,
     games.DrawImpossible: texts.DRAW_IMPOSSIBLE,
     games.RedrawLimitReached: texts.REDRAW_LIMIT,
+    games.RedrawAlreadyDone: texts.REDRAW_ALREADY_DONE,
     games.TooSoon: texts.REMINDER_TOO_SOON,
     games.RevealTooEarly: texts.REVEAL_TOO_EARLY,
     games.AlreadyRevealed: texts.REVEAL_ALREADY_DONE,

@@ -25,7 +25,7 @@ import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.core.models import Settings
@@ -38,6 +38,7 @@ _WEBHOOK_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{5,256}$")
 _PATH_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_.]{3,64}$")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_DOMAIN_RE = re.compile(r"^[^\s/:@]+\.[^\s/:@.]+$")
 _MONTH_DAY_RE = re.compile(r"^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
 _TRUE = {"1", "true", "yes", "on", "да"}
 _FALSE = {"0", "false", "no", "off", "нет", ""}
@@ -285,6 +286,9 @@ def _build(reader: _Reader, data_dir: Path, generated: Mapping[str, str]) -> Con
             if not passwords[name]:
                 problems.append(f"Задан ROBOKASSA_MERCHANT_LOGIN, но не задан {name} (кабинет Robokassa → "
                                 "Технические настройки).")
+        if robokassa_test:
+            reader.warnings.append("ROBOKASSA_TEST=1: оплата в тестовом режиме, деньги не списываются, а игры "
+                                   "расширяются. После проверки поставьте ROBOKASSA_TEST=0.")
     else:
         reader.warnings.append("ROBOKASSA_MERCHANT_LOGIN не задан: оплата выключена.")
     hash_name = reader.text("ROBOKASSA_HASH", "md5").lower()
@@ -374,7 +378,14 @@ def _build(reader: _Reader, data_dir: Path, generated: Mapping[str, str]) -> Con
 
 
 def _public_base_url(reader: _Reader) -> str:
+    """PUBLIC_BASE_URL, else https://DOMAIN. DOMAIN is a bare host name (Caddy uses it too);
+    MAX delivers webhooks only to https on port 443 and wants no port in the URL."""
     domain = reader.text("DOMAIN")
+    if domain and domain != "localhost" and not _DOMAIN_RE.match(domain):
+        reader.problems.append(
+            f"DOMAIN — только имя сайта, без https:// и без слешей, например santa-v-chate.ru (сейчас: {domain!r})."
+        )
+        domain = ""
     base_url = reader.text("PUBLIC_BASE_URL") or (f"https://{domain}" if domain else "")
     base_url = base_url.rstrip("/")
     if not base_url:
@@ -384,7 +395,19 @@ def _public_base_url(reader: _Reader) -> str:
     local = parts.hostname in ("localhost", "127.0.0.1")
     if parts.scheme != "https" and not (parts.scheme == "http" and local):
         reader.problems.append(f"PUBLIC_BASE_URL должен начинаться с https:// (сейчас: {base_url!r}).")
+    elif not local and (not parts.hostname or "." not in parts.hostname or _has_port(parts)):
+        reader.problems.append(
+            f"PUBLIC_BASE_URL должен быть вида https://santa-v-chate.ru, без порта: MAX присылает сообщения "
+            f"только на порт 443 (сейчас: {base_url!r})."
+        )
     return base_url
+
+
+def _has_port(parts: SplitResult) -> bool:
+    try:
+        return parts.port is not None
+    except ValueError:
+        return True  # not a number: still a port in the URL
 
 
 def _check_owner(reader: _Reader, full_name: str, inn: str, email: str, *, required: bool) -> None:

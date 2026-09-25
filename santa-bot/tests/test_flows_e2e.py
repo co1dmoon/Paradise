@@ -32,6 +32,8 @@ async def test_consent_gate_stores_only_id_and_source_then_resumes_the_payload(b
     assert user is not None and (user.first_source, user.max_name, user.username) == (f"j:{game.code}", None, None)
     assert user.consent_at is None and user.consent_version is None
     assert await repo.get_participant(bot.ctx.db, game.id, 201) is None
+    linked = "SELECT COUNT(*) FROM events WHERE user_id = 201 AND game_id IS NOT NULL"
+    assert await bot.ctx.db.fetchval(linked) == 0, "nothing ties the person to a game before consent"
 
     await bot(petr.say("привет"))
     await bot.forge(petr, f"{Action.MY_GAMES}")
@@ -199,6 +201,12 @@ async def test_relay_is_anonymous_routes_replies_and_reports(bot: Bot, api: Fake
     await bot(santa.press(texts.BTN_ASK_RECEIVER))
     assert santa.screen_text == texts.blocked(bot.ctx.config.support_email)
     assert (await repo.get_state(bot.ctx.db, 501, bot.ctx.clock.now())) is None
+
+    await bot(admin.press(texts.BTN_CLEAR_REPORTED))
+    assert admin.screen_text == texts.texts_cleared(user_id=501, code=game.code)
+    cleared = await repo.get_participant(bot.ctx.db, game.id, 501)
+    assert cleared is not None and (cleared.display_name, cleared.wishes) == ("Участник", None)
+    assert await bot.ctx.db.fetchval("SELECT COUNT(*) FROM relay_messages WHERE from_id = 501") == 0
 
 
 async def test_blocked_user_cannot_finish_a_pending_relay(bot: Bot, drawn) -> None:

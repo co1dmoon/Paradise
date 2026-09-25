@@ -9,10 +9,12 @@ worker. Interactive replies are sent directly (``send_now``, ``edit_now``,
 - per target (dialog or chat) one send or edit per second, plus a separate
   one-per-second lane for callback answers, so a dialog never exceeds MAX's 2/s.
 
-Failures: 429/transient errors (and 401, which is usually a config mistake being
-fixed, and alerts the admins) retry after 2, 5, 15, 60, 180 and 600 s, then the
-row is dead. Forbidden
-to a user sets ``users.dm_ok = 0``. Every final outcome reaches ``OutboxHooks``
+Failures: 429/transient errors retry after 2, 5, 15, 60, 180 and 600 s, then the
+row is dead. A 401 (a bad MAX_BOT_TOKEN: it alerts the admins) never kills a row:
+fixing the token means editing .env and restarting, which can take the owner hours,
+so the row waits and is tried every 5 minutes, and at once after a restart whose
+GET /me works (``retry_unauthorized_now``). Forbidden to a user sets
+``users.dm_ok = 0``. Every final outcome reaches ``OutboxHooks``
 (see ``app.delivery``), which tracks draw results and alerts the admins.
 
 The clock is injected; ``drain`` runs the worker to completion on a fake clock.
@@ -47,6 +49,8 @@ log = logging.getLogger(__name__)
 GLOBAL_PER_SECOND = 25.0
 PER_TARGET_INTERVAL = 1.0
 RETRY_DELAYS: tuple[int, ...] = (2, 5, 15, 60, 180, 600)
+UNAUTHORIZED_RETRY_DELAY = 300
+_UNAUTHORIZED_ERROR = "HTTP 401%"  # last_error of a row that waits for a working token
 IDLE_POLL_SECONDS = 2.0
 BATCH_SIZE = 100
 PURPOSE_DRAW_RESULT = "draw_result"
@@ -347,9 +351,10 @@ class Outbox:
                 await self.hooks.on_delivered(item)
 
     async def _retry(self, item: OutboxItem, error: MaxApiError) -> None:
+        if isinstance(error, Unauthorized):
+            await self._wait_for_token(item, error)
+            return
         attempts = item.attempts + 1
-        if isinstance(error, Unauthorized) and self.hooks is not None:
-            await self.hooks.on_unauthorized()
         if attempts > len(RETRY_DELAYS):
             await self._db.execute(
                 "UPDATE outbox SET status = 'dead', attempts = ?, last_error = ? WHERE id = ?",
@@ -362,6 +367,24 @@ class Outbox:
             "UPDATE outbox SET attempts = ?, not_before = ?, last_error = ? WHERE id = ?",
             (attempts, to_iso(not_before), str(error), item.id),
         )
+
+    async def _wait_for_token(self, item: OutboxItem, error: Unauthorized) -> None:
+        """401: the token, not the message, is wrong; the row keeps its attempts and waits."""
+        if self.hooks is not None:
+            await self.hooks.on_unauthorized()
+        not_before = self._clock.now() + timedelta(seconds=UNAUTHORIZED_RETRY_DELAY)
+        await self._db.execute(
+            "UPDATE outbox SET not_before = ?, last_error = ? WHERE id = ?", (to_iso(not_before), str(error), item.id)
+        )
+
+    async def retry_unauthorized_now(self) -> int:
+        """The token works (GET /me answered): send what waited for it without further delay."""
+        result = await self._db.execute(
+            "UPDATE outbox SET not_before = ? WHERE status = 'pending' AND last_error LIKE ?",
+            (to_iso(self._clock.now()), _UNAUTHORIZED_ERROR),
+        )
+        self.wake()
+        return result.rowcount
 
     async def _set_status(self, item_id: int, status: str, error: str | None) -> None:
         await self._db.execute(

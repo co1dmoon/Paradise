@@ -78,6 +78,21 @@ def test_https_required_except_localhost(tmp_path: Path) -> None:
     assert local.public_base_url == "http://localhost:8080"
 
 
+@pytest.mark.parametrize("domain", ["https://santa-v-chate.ru", "santa-v-chate.ru/", "santa-v-chate.ru:8443", "santa"])
+def test_domain_must_be_a_bare_host_name(tmp_path: Path, domain: str) -> None:
+    with pytest.raises(ConfigError) as error:
+        load_config(minimal_env(tmp_path, DOMAIN=domain), announce=lambda _: None)
+    assert "DOMAIN" in str(error.value)
+
+
+@pytest.mark.parametrize("base_url", ["https://santa.example.ru:8443", "https://santa.example.ru:443",
+                                      "https://santa.example.ru:x"])
+def test_webhooks_need_port_443(tmp_path: Path, base_url: str) -> None:
+    with pytest.raises(ConfigError) as error:
+        load_config(minimal_env(tmp_path, PUBLIC_BASE_URL=base_url), announce=lambda _: None)
+    assert "порт 443" in str(error.value)
+
+
 def test_username_normalized(tmp_path: Path) -> None:
     env = minimal_env(tmp_path, MAX_BOT_TOKEN="t", MAX_BOT_USERNAME="https://max.ru/se1234567_bot",
                       OWNER_FULL_NAME="Иванов И.И.", OWNER_INN="123456789012", SUPPORT_EMAIL="a@b.ru")

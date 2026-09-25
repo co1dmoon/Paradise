@@ -11,6 +11,7 @@ from aiohttp.test_utils import TestServer
 from app import repo
 from app.config import Config, load_config
 from app.context import CTX_KEY, AppContext
+from app.core import texts
 from app.core.analytics import Event, record
 from app.core.clock import FakeClock
 from app.core.models import PaymentStatus
@@ -134,7 +135,7 @@ async def test_draw_counter_is_hidden_below_50_and_cached_for_10_minutes(ctx: Ap
 
 def test_russian_plural() -> None:
     forms = ("жеребьёвка", "жеребьёвки", "жеребьёвок")
-    assert [pages.plural(n, *forms) for n in (1, 2, 5, 11, 21, 52, 112, 1000)] == [
+    assert [texts.plural(n, *forms) for n in (1, 2, 5, 11, 21, 52, 112, 1000)] == [
         "жеребьёвка", "жеребьёвки", "жеребьёвок", "жеребьёвок", "жеребьёвка", "жеребьёвки", "жеребьёвок",
         "жеребьёвок"]
 
@@ -187,7 +188,7 @@ async def test_healthz_reports_state(ctx: AppContext, clock: FakeClock) -> None:
         assert response.status == 200
         assert await response.json() == {
             "ok": True, "db_ok": True, "outbox_pending": 0, "last_update_at": "2026-11-20T09:00:00.000+00:00",
-            "webhook_registered": False, "bot_enabled": True, "payments_enabled": True,
+            "webhook_registered": False, "bot_enabled": True, "payments_enabled": True, "payments_test_mode": True,
         }
 
 

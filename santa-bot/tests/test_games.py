@@ -214,11 +214,22 @@ async def test_redraw_at_most_twice(db: Database, new_game, make_user, clock, rn
     game = await new_game()
     await join_many(db, clock, make_user, game.id, range(1, 5))
     await games.run_draw(db, game.id, ORGANIZER, now=clock.now(), rng=rng)
-    for expected in (1, 2):
-        result = await games.run_draw(db, game.id, ORGANIZER, now=clock.now(), rng=rng, redraw=True)
-        assert result.game.redraw_count == expected
+    for seen in (0, 1):
+        result = await games.run_draw(db, game.id, ORGANIZER, now=clock.now(), rng=rng, redraw_of=seen)
+        assert result.game.redraw_count == seen + 1
     with pytest.raises(games.RedrawLimitReached):
-        await games.run_draw(db, game.id, ORGANIZER, now=clock.now(), rng=rng, redraw=True)
+        await games.run_draw(db, game.id, ORGANIZER, now=clock.now(), rng=rng, redraw_of=2)
+
+
+async def test_redraw_runs_once_per_confirmation(db: Database, new_game, make_user, clock, rng) -> None:
+    game = await new_game()
+    await join_many(db, clock, make_user, game.id, range(1, 5))
+    await games.run_draw(db, game.id, ORGANIZER, now=clock.now(), rng=rng)
+    pairs = (await games.run_draw(db, game.id, ORGANIZER, now=clock.now(), rng=rng, redraw_of=0)).pairs
+    with pytest.raises(games.RedrawAlreadyDone):
+        await games.run_draw(db, game.id, ORGANIZER, now=clock.now(), rng=rng, redraw_of=0)
+    assert (await repo.get_game(db, game.id)).redraw_count == 1
+    assert await repo.assignments(db, game.id) == pairs
 
 
 async def test_leaving_after_draw_splices_the_cycle(db: Database, new_game, make_user, clock, rng) -> None:
@@ -233,6 +244,17 @@ async def test_leaving_after_draw_splices_the_cycle(db: Database, new_game, make
     assert not departure.splice.needs_redraw
     stored = await repo.assignments(db, game.id)
     assert leaving not in stored and leaving not in stored.values() and stored[giver] == pairs[leaving]
+
+
+async def test_a_spliced_santa_must_confirm_the_gift_again(db: Database, new_game, make_user, clock, rng) -> None:
+    game = await new_game()
+    await join_many(db, clock, make_user, game.id, range(1, 6))
+    pairs = (await games.run_draw(db, game.id, ORGANIZER, now=clock.now(), rng=rng)).pairs
+    leaving = 3
+    giver = next(g for g, r in pairs.items() if r == leaving)
+    await games.mark_gift_ready(db, game.id, giver)
+    await games.leave_game(db, game.id, leaving, clock.now())
+    assert not (await repo.get_participant(db, game.id, giver)).gift_ready, "the gift was for someone else"
 
 
 async def test_splice_down_to_two_asks_for_redraw(db: Database, new_game, make_user, clock, rng) -> None:

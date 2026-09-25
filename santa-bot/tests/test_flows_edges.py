@@ -427,8 +427,15 @@ async def test_my_games_and_cancel_command(bot: Bot, clock, olga) -> None:
     assert olga.screen_text == texts.INPUT_CANCELLED
     await bot(olga.say("/cancel"))
     assert olga.screen_text == texts.NOTHING_TO_CANCEL
+    await bot.create_game(olga, texts.DEFAULT_TITLE, participates=False)
+    await bot.create_game(olga, texts.DEFAULT_TITLE, participates=False)
     await bot(olga.press(texts.BTN_MY_GAMES))
-    assert olga.screen_text == f"{texts.MY_GAMES_HEADER}\nПервая — идёт набор, организатор"
+    assert olga.screen_text == (
+        f"{texts.MY_GAMES_HEADER}\n1. Тайный Санта — идёт набор, организатор\n"
+        "2. Тайный Санта — идёт набор, организатор\n3. Первая — идёт набор, организатор"
+    )
+    buttons = [b.text for b in bot.api.screen(ORGANIZER).buttons]
+    assert buttons[:3] == ["1. Тайный Санта", "2. Тайный Санта", "3. Первая"], "same titles stay apart"
     await bot(olga.say("просто текст"))
     assert olga.screen_text == texts.UNKNOWN_INPUT
     await bot(olga.say("/help"))

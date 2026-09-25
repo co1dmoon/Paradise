@@ -78,7 +78,9 @@ async def on_start(ctx: AppContext, update: BotStarted) -> None:
     s = await open_session(ctx, update.user, first_source=first_source(payload))
     if isinstance(payload, JoinPayload):
         game = await repo.get_game_by_code(ctx.db, payload.code)
-        await record(ctx.db, Event.INVITE_OPEN, s.now(), user_id=s.user_id, game_id=game.id if game else None)
+        # Before consent only the id, first touch and source are kept (§5.1): the event stays anonymous.
+        user_id = s.user_id if s.user.has_consent else None
+        await record(ctx.db, Event.INVITE_OPEN, s.now(), user_id=user_id, game_id=game.id if game else None)
     await start(s, update.payload)
 
 

@@ -34,10 +34,17 @@ def backup_name(day: date) -> str:
     return f"santa-{day:%Y%m%d}.db"
 
 
-async def make_backup(db: Database, directory: Path, day: date) -> Path:
-    """Copy the live database into ``directory`` (one file per day, replaced if it exists)."""
+async def make_backup(db: Database, directory: Path, day: date) -> Path | None:
+    """Copy the live database into ``directory``: one file per day; None when that day's file exists.
+
+    A day's copy is never replaced. After the owner restores an older copy (README_RU.md,
+    section 9) the scheduler makes up today's run from the restored data, and that must not
+    overwrite the copy taken earlier today, which may hold the last good data.
+    """
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / backup_name(day)
+    if target.exists():
+        return None
     partial = target.with_name(target.name + ".partial")
     partial.unlink(missing_ok=True)
     await db.backup_to(partial)

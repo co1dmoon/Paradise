@@ -4,7 +4,7 @@ Startup: config is validated before the app is built (fail fast), then
 1. open the database and apply migrations, seed settings from env (DB wins later);
 2. GET /me: log the bot name and warn the admins if it differs from MAX_BOT_USERNAME;
    register the '/' command menu (PATCH /me/commands);
-3. webhook mode: make sure our subscription exists; polling mode: start the poller;
+3. webhook mode: post our subscription (url, update types, secret); polling mode: start the poller;
 4. start the outbox worker and the scheduler.
 Without MAX_BOT_TOKEN steps 2–3 and the outbox are skipped: only the website runs.
 
@@ -23,7 +23,7 @@ import sys
 from collections.abc import AsyncIterator
 from aiohttp import web
 
-from app import repo, scheduler
+from app import jobs, repo, scheduler
 from app.alerts import Alerter
 from app.config import Config, ConfigError, load_config
 from app.context import CTX_KEY, AppContext
@@ -32,7 +32,7 @@ from app.core.clock import Clock, SystemClock
 from app.db import Database
 from app.delivery import DeliveryTracker
 from app.log import setup_logging
-from app.max_api import HttpMaxApi, MaxApi, MaxApiError, Unauthorized, ensure_subscription
+from app.max_api import HttpMaxApi, MaxApi, MaxApiError, Unauthorized
 from app.outbox import Outbox
 from app.tls import build_ssl_context
 from app.updates import process_update
@@ -104,7 +104,7 @@ async def _start_bot(ctx: AppContext) -> asyncio.Task[None] | None:
     await _register_commands(ctx)
     poller = None
     if config.mode == "webhook":
-        await _ensure_webhook(ctx)
+        await jobs.sync_webhook(ctx, startup=True)
     else:
         await _warn_about_webhook(ctx)
         poller = asyncio.create_task(_poll(ctx), name="poller")
@@ -122,6 +122,7 @@ async def _check_identity(ctx: AppContext) -> None:
         log.warning("GET /me failed", extra={"error": str(error)})
         return
     ctx.runtime.bot_username = me.username
+    await ctx.outbox.retry_unauthorized_now()
     log.info("bot identity", extra={"bot_username": me.username, "bot_id": me.user_id})
     configured = ctx.config.max_bot_username
     if me.username and me.username.lower() != configured.lower():
@@ -136,28 +137,18 @@ async def _register_commands(ctx: AppContext) -> None:
         log.warning("command menu not registered", extra={"error": str(error)})
 
 
-async def _ensure_webhook(ctx: AppContext) -> None:
-    try:
-        created = await ensure_subscription(ctx.api, ctx.config.webhook_url, ctx.config.max_webhook_secret)
-    except Unauthorized:
-        await ctx.alerts.token_rejected()
-        return
-    except MaxApiError as error:
-        log.error("webhook subscription failed", extra={"error": str(error)})
-        return
-    ctx.runtime.webhook_registered = True
-    log.info("webhook subscription " + ("created" if created else "present"))
-
-
 async def _warn_about_webhook(ctx: AppContext) -> None:
-    """In polling mode MAX may not deliver updates while a webhook exists (unverified)."""
+    """MAX does not deliver updates by polling while a webhook subscription exists (dev.max.ru,
+    POST /subscriptions, checked 2026-09-25). The subscription is not removed here: it may be
+    the production bot's, and a local test must never switch production off."""
     try:
         subscriptions = await ctx.api.list_subscriptions()
     except MaxApiError as error:
         log.warning("could not list webhook subscriptions", extra={"error": str(error)})
         return
     if subscriptions:
-        log.warning("MODE=polling but a webhook subscription exists; updates may not arrive by polling")
+        log.error("MODE=polling, but the bot has a webhook subscription: MAX delivers nothing by polling "
+                  "while it exists. Use a separate test bot, or MODE=webhook")
 
 
 async def _poll(ctx: AppContext) -> None:

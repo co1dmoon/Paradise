@@ -74,10 +74,41 @@ async def test_upgrade_price_difference_and_double_payment(db, full_game, prices
     await billing.confirm_payment(db, first.inv_id, prices, raw="", now=clock.now())
     outcome = await billing.confirm_payment(db, second.inv_id, prices, raw="", now=clock.now())
     assert outcome is not None and outcome.duplicates == (first.inv_id, second.inv_id)
+    assert outcome.fully_excess and outcome.excess_rub == 490
     with pytest.raises(billing.NoUpgradeAvailable):
         await billing.request_upgrade(db, full_game.id, 11, Tier.S, prices, clock.now())
     to_m = await billing.request_upgrade(db, full_game.id, 11, Tier.M, prices, clock.now())
     assert to_m.amount_rub == 990 - 980 == 10
+
+
+async def test_an_older_link_for_a_bigger_tier_is_charged_too_much(db, full_game, prices, clock) -> None:
+    """§4: an upgrade costs the difference. A link priced before another payment arrived overcharges."""
+    to_m = await billing.request_upgrade(db, full_game.id, ORGANIZER, Tier.M, prices, clock.now())
+    to_s = await billing.request_upgrade(db, full_game.id, 11, Tier.S, prices, clock.now())
+    assert (to_m.amount_rub, to_s.amount_rub) == (990, 490)
+    s_paid = await billing.confirm_payment(db, to_s.inv_id, prices, raw="", now=clock.now())
+    assert s_paid is not None and s_paid.excess_rub == 0
+    m_paid = await billing.confirm_payment(db, to_m.inv_id, prices, raw="", now=clock.now())
+    assert m_paid is not None and m_paid.game is not None and m_paid.game.tier == Tier.M
+    assert (m_paid.excess_rub, m_paid.fully_excess, m_paid.duplicates) == (490, False, ())
+
+
+async def test_an_older_link_for_a_smaller_tier_buys_nothing(db, full_game, prices, clock) -> None:
+    to_m = await billing.request_upgrade(db, full_game.id, ORGANIZER, Tier.M, prices, clock.now())
+    to_s = await billing.request_upgrade(db, full_game.id, 11, Tier.S, prices, clock.now())
+    await billing.confirm_payment(db, to_m.inv_id, prices, raw="", now=clock.now())
+    s_paid = await billing.confirm_payment(db, to_s.inv_id, prices, raw="", now=clock.now())
+    assert s_paid is not None and s_paid.fully_excess and s_paid.excess_rub == 490 and s_paid.duplicates == ()
+    assert s_paid.game is not None and (s_paid.game.tier, s_paid.game.participant_limit) == (Tier.M, 100)
+
+
+async def test_a_payment_after_the_draw_is_not_applied(db, full_game, prices, clock, rng) -> None:
+    payment = await billing.request_upgrade(db, full_game.id, 11, Tier.S, prices, clock.now())
+    await games.run_draw(db, full_game.id, ORGANIZER, now=clock.now(), rng=rng)
+    outcome = await billing.confirm_payment(db, payment.inv_id, prices, raw="", now=clock.now())
+    assert outcome is not None and outcome.game_not_collecting and outcome.fully_excess
+    assert outcome.activated == []
+    assert outcome.game is not None and (outcome.game.tier, outcome.game.participant_limit) == (Tier.FREE, 10)
 
 
 async def test_grant_and_refund(db, full_game, prices, clock) -> None:
@@ -159,3 +190,15 @@ async def test_relay_needs_anon_chat_and_draw(db, full_game, clock, rng) -> None
         await relay.route_new(db, full_game.id, 1, RelayDirection.TO_RECEIVER)
     waiting = await repo.get_participant(db, full_game.id, 12)
     assert waiting is not None and waiting.status == ParticipantStatus.WAITING
+
+
+async def test_invids_stay_unique_after_restoring_an_older_backup(db, full_game, prices, clock) -> None:
+    """Robokassa needs a new InvId for every payment, also after the database was rolled back."""
+    issued = await billing.request_upgrade(db, full_game.id, 11, Tier.S, prices, clock.now())
+    await db.execute("DELETE FROM payments")  # the restored copy predates this payment
+    await db.execute("DELETE FROM sqlite_sequence WHERE name = 'payments'")
+    clock.advance(600)  # a restore takes minutes
+    fresh = await billing.request_upgrade(db, full_game.id, 11, Tier.S, prices, clock.now())
+    assert fresh.inv_id > issued.inv_id
+    again = await billing.request_upgrade(db, full_game.id, 12, Tier.S, prices, clock.now())
+    assert again.inv_id == fresh.inv_id + 1

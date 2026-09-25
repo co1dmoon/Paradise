@@ -46,7 +46,8 @@ async def participants_activated(ctx: AppContext, game: Game, activated: Sequenc
 async def departed(ctx: AppContext, game: Game, departure: Departure | None) -> None:
     """Someone left or was removed: people from the queue take the place (before the draw), or
     the leaver's Santa gets a new receiver (after it, P1); the organizer is asked to redraw
-    when the new pair is excluded or fewer than 3 people remain."""
+    when the new pair is excluded, or told why a redraw cannot help (fewer than 3 people
+    remain, or both redraws are used up)."""
     if departure is None:
         return
     await participants_activated(ctx, game, departure.activated)
@@ -57,7 +58,7 @@ async def departed(ctx: AppContext, game: Game, departure: Departure | None) -> 
     if receiver is not None:
         await _to(ctx, splice.giver_id, views.receiver_left(game, receiver), game_id=game.id)
     if splice.needs_redraw:
-        await _to(ctx, game.organizer_id, views.splice_needs_redraw(game), game_id=game.id)
+        await _to(ctx, game.organizer_id, views.splice_problem(game, too_few=splice.too_few), game_id=game.id)
 
 
 async def participant_removed(ctx: AppContext, game: Game, person: Participant) -> None:
@@ -107,25 +108,50 @@ async def draw_results(ctx: AppContext, result: DrawResult, *, redraw: bool = Fa
 
 
 async def payment_applied(ctx: AppContext, outcome: PaymentOutcome) -> None:
-    """After a tier was applied (§5.6): the queue, the payer, the organizer and the admins."""
+    """After a payment was applied (§5.6): the queue, the payer, the organizer and the admins.
+
+    Money that bought nothing (the game was drawn or cancelled meanwhile, or an older link
+    was paid after another upgrade) is announced to the admins for a refund and to the
+    payer as such; the organizer hears about a payment only when it enlarged the game.
+    """
     game, payment = outcome.game, outcome.payment
     if game is None:
         return
-    if outcome.duplicates:
-        first, *_, last = outcome.duplicates
-        await ctx.alerts.notify_admins(texts.double_payment(code=game.code, first_inv=first, second_inv=last))
-    if outcome.game_not_collecting:
-        await ctx.alerts.notify_admins(texts.payment_after_draw(code=game.code, inv_id=payment.inv_id))
+    await _alert_admins(ctx, game, outcome)
     await participants_activated(ctx, game, outcome.activated)
     if payment.payer_id is None:
         return
-    limit = game.participant_limit
-    await _to(ctx, payment.payer_id, texts.payment_received(title=game.title, limit=limit),
+    await _to(ctx, payment.payer_id, _payer_text(ctx, game, outcome),
               dedupe_key=f"paid:{payment.inv_id}:payer", game_id=game.id)
-    if payment.payer_id != game.organizer_id:
+    if payment.payer_id != game.organizer_id and not outcome.fully_excess:
         payer = await payer_name(ctx, game, payment.payer_id)
-        await _to(ctx, game.organizer_id, texts.payer_paid(payer=payer, title=game.title, limit=limit),
-                  dedupe_key=f"paid:{payment.inv_id}:organizer", game_id=game.id)
+        text = texts.payer_paid(payer=payer, title=game.title, limit=game.participant_limit)
+        await _to(ctx, game.organizer_id, text, dedupe_key=f"paid:{payment.inv_id}:organizer", game_id=game.id)
+
+
+async def _alert_admins(ctx: AppContext, game: Game, outcome: PaymentOutcome) -> None:
+    payment = outcome.payment
+    if outcome.game_not_collecting:
+        await ctx.alerts.notify_admins(texts.payment_after_draw(code=game.code, inv_id=payment.inv_id))
+    elif outcome.duplicates:
+        first, *_, last = outcome.duplicates
+        await ctx.alerts.notify_admins(texts.double_payment(code=game.code, first_inv=first, second_inv=last))
+    elif outcome.excess_rub:
+        await ctx.alerts.notify_admins(texts.overpayment(
+            code=game.code, inv_id=payment.inv_id, amount=payment.amount_rub, excess=outcome.excess_rub))
+
+
+def _payer_text(ctx: AppContext, game: Game, outcome: PaymentOutcome) -> str:
+    email, amount = ctx.config.support_email, outcome.payment.amount_rub
+    if outcome.game_not_collecting:
+        return texts.payment_too_late(title=game.title, amount=amount, support_email=email)
+    if outcome.fully_excess:
+        return texts.payment_not_needed(title=game.title, limit=game.participant_limit, amount=amount,
+                                        support_email=email)
+    received = texts.payment_received(title=game.title, limit=game.participant_limit)
+    if outcome.excess_rub:
+        return f"{received} {texts.partial_refund(excess=outcome.excess_rub, support_email=email)}"
+    return received
 
 
 async def payer_name(ctx: AppContext, game: Game, user_id: int) -> str:
@@ -154,7 +180,11 @@ async def join_notice(ctx: AppContext, game: Game, newcomers: Sequence[Participa
 
 
 async def waiting_notice(ctx: AppContext, game: Game, waiting: int, upgrade: Upgrade | None, *, db: Db) -> None:
-    await _to(ctx, game.organizer_id, views.waiting_notice(game, waiting, upgrade), game_id=game.id, db=db)
+    """Without an upgrade to offer, a game at the top tier points to the e-mail for bigger games (§4)."""
+    top_tier = upgrade is None and ctx.config.payments_enabled
+    contact = ctx.config.support_email if top_tier else None
+    await _to(ctx, game.organizer_id, views.waiting_notice(game, waiting, upgrade, contact_email=contact),
+              game_id=game.id, db=db)
 
 
 async def organizer_nudge(ctx: AppContext, game: Game, days: int, active: int, *, db: Db) -> None:

@@ -13,7 +13,8 @@ Retention (03:30 MSK):
   the exchange date, or 180 days after creation when there is no date. Payments stay
   for accounting; their game_id becomes NULL;
 - anonymous messages are deleted after 30 days, and so are closed complaints, which
-  quote them (open complaints wait for an admin);
+  quote them; open complaints wait for an admin but lose the quoted text (the admins
+  got it when the complaint was made);
 - users who never consented are deleted after 7 days; users with no games for 365
   days are deleted (counted from the date of their last game, see ``last_game_at``);
   events and payments of deleted users lose the user id;
@@ -94,6 +95,10 @@ async def purge(db: Db, now: datetime, today: date) -> PurgeReport:
         )
         reports = await tx.execute(
             "DELETE FROM reports WHERE resolved = 1 AND created_at <= ?", (to_iso(now - RELAY_RETENTION),)
+        )
+        await tx.execute(
+            "UPDATE reports SET text = '' WHERE resolved = 0 AND text <> '' AND created_at <= ?",
+            (to_iso(now - RELAY_RETENTION),),
         )
         users = await _delete_users(tx, now)
         payments = await tx.execute(

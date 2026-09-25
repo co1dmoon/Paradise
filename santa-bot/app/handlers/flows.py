@@ -299,7 +299,7 @@ async def join(s: Session, code: str, via: JoinVia) -> None:
             await ask_for_wishes(s, game.id)
             await group.card_changed(s.ctx, game.id)
         case JoinOutcome.WAITING:
-            await s.say(views.waiting(game, await s.ctx.settings(), await offer_upgrade(s.ctx, game)))
+            await s.say(views.waiting(game, await offer_upgrade(s.ctx, game)))
         case JoinOutcome.ALREADY_IN:
             assert result.participant is not None
             await show_participant_view(s, game, result.participant)

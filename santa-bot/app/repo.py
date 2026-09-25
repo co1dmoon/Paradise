@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from app.core.clock import from_iso, to_iso
@@ -35,6 +35,7 @@ from app.core.models import (
 from app.db import Db
 
 STATE_TTL = timedelta(minutes=30)
+INV_ID_EPOCH = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 # --- users -------------------------------------------------------------------
 
@@ -202,6 +203,27 @@ async def games_in_status(db: Db, status: GameStatus) -> list[Game]:
     return [from_row(Game, row) for row in rows]
 
 
+async def erase_user(db: Db, user_id: int) -> None:
+    """Delete a user's personal data (``games.forget_user`` first ends their running games).
+
+    Games they organized go with all their rows; participations and pending input go by
+    ON DELETE CASCADE with the user row; payments and events lose the user id.
+    """
+    both = (user_id, user_id)
+    await db.execute("DELETE FROM relay_messages WHERE from_id = ? OR to_id = ?", both)
+    await db.execute("DELETE FROM reports WHERE reporter_id = ? OR reported_id = ?", both)
+    await db.execute("DELETE FROM exclusions WHERE user_a = ? OR user_b = ?", both)
+    await db.execute("DELETE FROM assignments WHERE giver_id = ? OR receiver_id = ?", both)
+    await db.execute("DELETE FROM outbox WHERE target_type = 'user' AND target_id = ?", (user_id,))
+    for (game_id,) in await db.fetchall("SELECT id FROM games WHERE organizer_id = ?", (user_id,)):
+        await db.execute("DELETE FROM reports WHERE game_id = ?", (game_id,))
+        await db.execute("DELETE FROM outbox WHERE game_id = ?", (game_id,))
+        await db.execute("DELETE FROM games WHERE id = ?", (game_id,))
+    await db.execute("UPDATE payments SET payer_id = NULL WHERE payer_id = ?", (user_id,))
+    await db.execute("UPDATE events SET user_id = NULL WHERE user_id = ?", (user_id,))
+    await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+
+
 async def games_of_user(db: Db, user_id: int) -> list[tuple[Game, Participant | None]]:
     """Games the user organizes or takes part in (active or waiting), newest first."""
     rows = await db.fetchall(
@@ -290,9 +312,18 @@ async def set_wishes(db: Db, game_id: int, user_id: int, wishes: str) -> None:
     )
 
 
-async def set_gift_ready(db: Db, game_id: int, user_id: int) -> None:
+async def clear_participant_texts(db: Db, game_id: int, user_id: int, name: str) -> None:
+    """Moderation: the person's wishes, display name and anonymous messages in one game."""
     await db.execute(
-        "UPDATE participants SET gift_ready = 1 WHERE game_id = ? AND user_id = ?", (game_id, user_id)
+        "UPDATE participants SET wishes = NULL, display_name = ? WHERE game_id = ? AND user_id = ?",
+        (name, game_id, user_id),
+    )
+    await db.execute("DELETE FROM relay_messages WHERE game_id = ? AND from_id = ?", (game_id, user_id))
+
+
+async def set_gift_ready(db: Db, game_id: int, user_id: int, ready: bool = True) -> None:
+    await db.execute(
+        "UPDATE participants SET gift_ready = ? WHERE game_id = ? AND user_id = ?", (ready, game_id, user_id)
     )
 
 
@@ -410,15 +441,27 @@ async def insert_payment(
     now: datetime,
 ) -> Payment:
     paid_at = to_iso(now) if status in (PaymentStatus.PAID, PaymentStatus.GRANTED) else None
-    result = await db.execute(
-        "INSERT INTO payments (game_id, payer_id, tier, amount_rub, status, provider, created_at, paid_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (game_id, payer_id, tier, amount_rub, status, provider, to_iso(now), paid_at),
+    inv_id = await _next_inv_id(db, now)
+    await db.execute(
+        "INSERT INTO payments (inv_id, game_id, payer_id, tier, amount_rub, status, provider, created_at, paid_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (inv_id, game_id, payer_id, tier, amount_rub, status, provider, to_iso(now), paid_at),
     )
-    assert result.lastrowid is not None
-    payment = await get_payment(db, result.lastrowid)
+    payment = await get_payment(db, inv_id)
     assert payment is not None
     return payment
+
+
+async def _next_inv_id(db: Db, now: datetime) -> int:
+    """The Robokassa InvId: the next number, but never below the seconds since INV_ID_EPOCH.
+
+    InvIds must be unique at Robokassa forever. The database's own counter goes back when
+    the owner restores an older backup, and a reused InvId could take a late notice for an
+    old payment as payment for a new one. Seconds keep growing across restores; far more
+    than one payment per second for minutes on end would be needed to catch up with them.
+    """
+    last = int(await db.fetchval("SELECT COALESCE(MAX(inv_id), 0) FROM payments"))
+    return max(last + 1, int((now - INV_ID_EPOCH).total_seconds()))
 
 
 async def reusable_payment(

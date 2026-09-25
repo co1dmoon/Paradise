@@ -19,7 +19,7 @@ from app.core.dates import in_season_window
 from app.core.games import ACTIVE, WAITING
 from app.core.models import GameStatus
 from app.handlers import flows, notices
-from app.max_api import MaxApiError, Unauthorized, ensure_subscription
+from app.max_api import MaxApiError, Transient, Unauthorized, ensure_subscription
 from app.tls import CERTS_DIR, build_ssl_context, bundled_certificates
 
 log = logging.getLogger(__name__)
@@ -31,6 +31,7 @@ NUDGE_FROM, NUDGE_UNTIL = time(10), time(21)  # the nudge starts when a day star
 OUTBOX_RETENTION = timedelta(days=7)
 PROCESSED_UPDATES_RETENTION = timedelta(days=3)
 CERTIFICATE_WARNING = timedelta(days=30)
+WEBHOOK_ALERT_INTERVAL = 3600.0
 
 
 # --- every minute: organizer notices (§5.4, §5.6, §5.9 a–b) ---------------------------------------
@@ -130,6 +131,9 @@ async def backup_database(ctx: AppContext) -> None:
     also to the S3 bucket when S3_* is set (P1)."""
     config = ctx.config
     path = await backup.make_backup(ctx.db, config.backups_dir, ctx.today())
+    if path is None:
+        log.warning("today's backup already exists and is kept")
+        return
     removed = backup.rotate(config.backups_dir)
     log.info("backup written", extra={"file": path.name, "removed": len(removed)})
     if not config.s3_enabled:
@@ -149,20 +153,44 @@ async def backup_database(ctx: AppContext) -> None:
 
 async def webhook_watchdog(ctx: AppContext) -> None:
     """Every 10 minutes: MAX deletes a subscription after 8 hours of failures; put it back."""
+    await sync_webhook(ctx, startup=False)
+
+
+async def sync_webhook(ctx: AppContext, *, startup: bool) -> None:
+    """Make sure MAX sends our updates to our address with our secret (§11 step 4, §10).
+
+    Startup always posts the subscription (the secret may have changed); so does the
+    watchdog while the subscription is not known to work. The admins hear when it fails
+    (at most hourly, with MAX's reason), when a lost subscription was restored and when it
+    works again after a failure: the owner has no other sign that the bot receives nothing.
+    A passing network hiccup while everything works is only logged.
+    """
+    runtime = ctx.runtime
+    config = ctx.config
     try:
-        created = await ensure_subscription(ctx.api, ctx.config.webhook_url, ctx.config.max_webhook_secret)
+        missing = await ensure_subscription(ctx.api, config.webhook_url, config.max_webhook_secret,
+                                            refresh=startup or not runtime.webhook_registered)
     except Unauthorized:
         await ctx.alerts.token_rejected()
         return
     except MaxApiError as error:
-        log.warning("webhook check failed", extra={"error": str(error)})
+        if isinstance(error, Transient) and runtime.webhook_registered:
+            log.warning("webhook check failed", extra={"error": str(error)})
+            return
+        log.error("webhook subscription failed", extra={"error": str(error)})
+        runtime.webhook_registered = False
+        await ctx.alerts.alert("webhook", texts.webhook_failed(error.detail), min_interval=WEBHOOK_ALERT_INTERVAL)
         return
-    if not created:
-        return
-    if ctx.runtime.webhook_registered:
+    was_working = runtime.webhook_registered
+    runtime.webhook_registered = True
+    if startup:
+        log.info("webhook subscription " + ("created" if missing else "updated"))
+    elif missing:
+        log.warning("webhook subscription (re)created")
         await ctx.alerts.notify_admins(texts.WEBHOOK_RESTORED)
-    log.warning("webhook subscription (re)created")
-    ctx.runtime.webhook_registered = True
+    elif not was_working:
+        log.info("webhook subscription works again")
+        await ctx.alerts.notify_admins(texts.WEBHOOK_WORKS)
 
 
 async def certificate_check(ctx: AppContext, certs_dir: Path = CERTS_DIR) -> None:
@@ -172,7 +200,8 @@ async def certificate_check(ctx: AppContext, certs_dir: Path = CERTS_DIR) -> Non
         if certificate.not_after - now <= CERTIFICATE_WARNING:
             expires = certificate.not_after.astimezone(ctx.config.tz).date()
             await ctx.alerts.notify_admins(texts.certificate_expiring(
-                name=certificate.common_name, expires=expires, days=(expires - today).days))
+                name=certificate.common_name, file=certificate.path.name, expires=expires,
+                days=(expires - today).days))
 
 
 async def digest(ctx: AppContext) -> None:

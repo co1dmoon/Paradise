@@ -57,7 +57,11 @@ def test_panel_and_waiting() -> None:
     panel = texts.panel(title="Офис", code="ABC234", active=10, limit=10, waiting=2, without_wishes=3, exclusions=1,
                         budget="до 1000 ₽", exchange_date=date(2026, 12, 25))
     assert "Участников: 10 из 10; в очереди: 2" in panel and "Обмен: 25 декабря" in panel
-    assert "до 30 человек может любой участник — 490 ₽" in texts.waiting_list(free_limit=10, limit=30, price=490)
+    free = texts.waiting_list(free=True, current_limit=10, limit=30, price=490)
+    assert free.startswith("Мест нет: в бесплатной игре до 10 участников.")
+    assert "до 30 человек может любой участник — 490 ₽" in free
+    paid = texts.waiting_list(free=False, current_limit=30, limit=100, price=500)
+    assert paid.startswith("Мест нет: все 30 мест в игре заняты.") and "бесплатн" not in paid
 
 
 def test_every_date_error_has_a_message() -> None:
@@ -73,3 +77,21 @@ def test_button_labels_fit() -> None:
     labels = [value for name, value in vars(texts).items() if name.startswith("BTN_") and isinstance(value, str)]
     labels += list(texts.BUDGET_PRESETS)
     assert labels and all(len(label) <= 40 for label in labels)
+
+
+def test_draw_confirmation_agrees_in_number() -> None:
+    assert texts.draw_confirm(active=21, without_wishes=1, waiting=1) == (
+        "Провести жеребьёвку для 21 участника? После этого вступить будет нельзя. "
+        "У 1 человека нет пожеланий. В очереди 1 человек — он не попадёт в игру."
+    )
+    assert texts.draw_confirm(active=12, without_wishes=3, waiting=2).endswith(
+        "У 3 человек нет пожеланий. В очереди 2 человека — они не попадут в игру.")
+
+
+def test_pair_texts_mention_anonymous_questions_only_when_they_are_on() -> None:
+    kwargs = {"title": "Офис", "receiver": "Мария К.", "wishes": None, "budget": "до 500 ₽", "exchange_date": None}
+    assert "Вы — Тайный Санта для: Мария К.\n" in texts.draw_result(**kwargs)
+    assert "можно спросить анонимно" in texts.draw_result(**kwargs)
+    assert "Пожелания: «не написаны»\n" in texts.draw_result(**kwargs, anon_chat=False)
+    assert texts.whom_do_i_gift(title="Офис", receiver="Иван", wishes=None, anon_chat=False).endswith("«не написаны»")
+    assert texts.receiver_left(receiver="Иван", wishes=None, anon_chat=False).endswith("«не написаны»")

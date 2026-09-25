@@ -289,9 +289,9 @@ async def _change_name(s: Session, args: Args) -> None:
 @on(Action.LEAVE)
 async def _leave(s: Session, args: Args) -> None:
     game = await games.load_game(s.db, args.number(0))
-    await flows.require_me(s, game.id)
+    me = await flows.require_me(s, game.id)
     games.require_status(game, *_OPEN)
-    await s.show(views.confirm_leave(game))
+    await s.show(views.confirm_leave(game, me))
 
 
 @on(Action.LEAVE_CONFIRM)
@@ -481,12 +481,16 @@ async def _redraw(s: Session, args: Args) -> None:
 
 @on(Action.REDRAW_CONFIRM)
 async def _redraw_confirm(s: Session, args: Args) -> None:
-    """P1 (§5.5): new pairs for everyone, at most twice; the old ones stop counting."""
-    game_id = args.number(0)
+    """P1 (§5.5): new pairs for everyone, at most twice; the old ones stop counting.
+
+    The payload carries the redraw count the confirmation was shown for, so a double tap
+    or an old confirmation cannot reshuffle the pairs a second time.
+    """
+    game_id, seen = args.number(0), args.number(1)
     await s.acknowledge()
     try:
         async with s.ctx.locks.game(game_id):
-            result = await games.run_draw(s.db, game_id, s.user_id, now=s.now(), rng=s.ctx.rng, redraw=True)
+            result = await games.run_draw(s.db, game_id, s.user_id, now=s.now(), rng=s.ctx.rng, redraw_of=seen)
     except games.DrawImpossible:
         await s.say(OutMessage(texts.REDRAW_IMPOSSIBLE, kb.keyboard(views.panel_button(game_id))))
         return

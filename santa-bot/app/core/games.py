@@ -33,7 +33,7 @@ from app.core.models import (
     User,
 )
 from app.core.payloads import generate_code
-from app.core.users import display_name_from_profile
+from app.core.users import FALLBACK_NAME, display_name_from_profile
 from app.db import Db
 
 DAILY_GAME_LIMIT = 20
@@ -80,6 +80,10 @@ class DrawImpossible(GameError):
 
 class RedrawLimitReached(GameError):
     pass
+
+
+class RedrawAlreadyDone(GameError):
+    """The redraw this confirmation was shown for has already happened (double tap, stale button)."""
 
 
 class TooSoon(GameError):
@@ -153,6 +157,14 @@ class Departure:
     participant: Participant
     activated: list[Participant]
     splice: Splice | None
+
+
+@dataclass(frozen=True, slots=True)
+class Erasure:
+    """What deleting a user's data changed in games that were still running."""
+
+    cancelled: list[tuple[Game, list[Participant]]]  # games they organized, and who must be told
+    departures: list[tuple[Game, Departure]]  # games they played in
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,6 +435,7 @@ async def _splice(db: Db, game_id: int, leaving_id: int) -> Splice | None:
     if giver is None or receiver is None or giver == receiver:
         return None
     await repo.insert_assignment(db, game_id, giver, receiver)
+    await repo.set_gift_ready(db, game_id, giver, False)  # the gift was for the old receiver
     excluded = (min(giver, receiver), max(giver, receiver)) in set(await repo.exclusions(db, game_id))
     remaining = await repo.count_participants(db, game_id, ACTIVE)
     return Splice(giver, receiver, excluded=excluded, too_few=remaining < MIN_PARTICIPANTS)
@@ -461,6 +474,46 @@ async def set_wishes(db: Db, game_id: int, user_id: int, wishes: str, now: datet
         await require_participant(tx, game_id, user_id, ACTIVE, WAITING)
         await repo.set_wishes(tx, game_id, user_id, wishes)
         await record(tx, Event.WISHES_SAVED, now, user_id=user_id, game_id=game_id)
+
+
+# --- the user's data: deletion on request and moderation (§11) ---------------------------
+
+
+async def forget_user(db: Db, user_id: int, now: datetime) -> Erasure | None:
+    """Delete everything about a user, as the privacy policy promises (consent withdrawn,
+    deletion asked). None when the user is unknown.
+
+    Running games they organize are cancelled and then deleted with the rest of their
+    games; from running games they play in they leave (a drawn cycle is spliced). Then
+    their participations, wishes, pairs, exclusions, anonymous messages, complaints,
+    pending input, queued messages and profile go; payments and events keep only the
+    amounts and counts. The caller tells the people in the returned ``Erasure``.
+    """
+    async with db.transaction() as tx:
+        if await repo.get_user(tx, user_id) is None:
+            return None
+        cancelled: list[tuple[Game, list[Participant]]] = []
+        departures: list[tuple[Game, Departure]] = []
+        for game, participant in await repo.games_of_user(tx, user_id):
+            if game.status not in (GameStatus.COLLECTING, GameStatus.DRAWN):
+                continue
+            if game.organizer_id == user_id:
+                people = [p for p in await _cancel(tx, game.id, now) if p.user_id != user_id]
+                cancelled.append((await load_game(tx, game.id), people))
+            elif participant is not None:
+                departures.append((game, await _depart(tx, game, participant, ParticipantStatus.LEFT, now)))
+        await repo.erase_user(tx, user_id)
+        return Erasure(cancelled, departures)
+
+
+async def clear_texts(db: Db, game_id: int, user_id: int) -> Participant | None:
+    """Moderation: remove what a person wrote in one game (wishes, display name, anonymous
+    messages). None when they never were in that game."""
+    async with db.transaction() as tx:
+        if await repo.get_participant(tx, game_id, user_id) is None:
+            return None
+        await repo.clear_participant_texts(tx, game_id, user_id, FALLBACK_NAME)
+        return await repo.get_participant(tx, game_id, user_id)
 
 
 # --- organizer tools --------------------------------------------------------------------
@@ -585,18 +638,23 @@ async def run_draw(
     *,
     now: datetime,
     rng: random.Random,
-    redraw: bool = False,
+    redraw_of: int | None = None,
     time_budget: float = SEARCH_BUDGET_SECONDS,
 ) -> DrawResult:
     """Draw (or redraw, at most twice) and store the pairs with status=drawn in one transaction.
 
+    ``redraw_of`` makes it a redraw: the game's ``redraw_count`` the organizer saw when
+    confirming. A second tap on the same confirmation finds a higher count and is refused,
+    so one confirmation reshuffles the pairs exactly once.
+
     The search runs in a worker thread so a slow fallback never blocks the event loop.
     Sending the results is the caller's job (outbox, purpose ``draw_result``).
     """
+    redraw = redraw_of is not None
     expected = GameStatus.DRAWN if redraw else GameStatus.COLLECTING
     game = await _load_organized(db, game_id, organizer_id, expected)
-    if redraw and game.redraw_count >= MAX_REDRAWS:
-        raise RedrawLimitReached(game.redraw_count)
+    if redraw:
+        _check_redraw(game, redraw_of)
     active = await repo.participants(db, game_id, ACTIVE)
     if len(active) < MIN_PARTICIPANTS:
         raise NotEnoughParticipants(len(active))
@@ -610,17 +668,27 @@ async def run_draw(
         current = {p.user_id for p in await repo.participants(tx, game_id, ACTIVE)}
         if fresh.status != expected or current != set(ids):
             raise WrongStatus(fresh.status)
+        if redraw:
+            _check_redraw(fresh, redraw_of)
         await repo.replace_assignments(tx, game_id, pairs)
         await repo.update_game(
             tx, game_id, status=GameStatus.DRAWN, drawn_at=now, redraw_count=fresh.redraw_count + int(redraw)
         )
         await tx.execute(
-            "UPDATE participants SET result_dm_ok = NULL WHERE game_id = ? AND status = 'active'", (game_id,)
+            "UPDATE participants SET result_dm_ok = NULL, gift_ready = 0 WHERE game_id = ? AND status = 'active'",
+            (game_id,),
         )
         await record(tx, Event.DRAW_DONE, now, user_id=organizer_id, game_id=game_id, n=len(ids), redraw=redraw)
         drawn = await load_game(tx, game_id)
         by_user = {p.user_id: p for p in await repo.participants(tx, game_id, ACTIVE)}
     return DrawResult(drawn, pairs, by_user)
+
+
+def _check_redraw(game: Game, confirmed_count: int | None) -> None:
+    if game.redraw_count != confirmed_count:
+        raise RedrawAlreadyDone(game.redraw_count)
+    if game.redraw_count >= MAX_REDRAWS:
+        raise RedrawLimitReached(game.redraw_count)
 
 
 async def my_receiver(db: Db, game_id: int, user_id: int) -> Participant | None:

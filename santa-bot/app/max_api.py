@@ -11,7 +11,9 @@ Checked against dev.max.ru on 2026-09-24:
   button) and ``disable_link_preview``; ``notification`` is NOT documented, so
   ``answer`` falls back to answering without it (see ``HttpMaxApi.answer``).
 - POST /subscriptions {url, update_types, secret}; the secret must match
-  ^[a-zA-Z0-9_-]{5,256}$. GET /subscriptions → {subscriptions: [{url, time, update_types}]}.
+  ^[a-zA-Z0-9_-]{5,256}$. The same call updates an existing subscription.
+  GET /subscriptions → {subscriptions: [{url, time, update_types}]} (never the secret).
+  DELETE /subscriptions?url=… removes one (checked 2026-09-25).
 - GET /updates?limit=1..1000&timeout=0..90&marker= → {updates: [...], marker}.
 - PATCH /me/commands {commands: [{name, description}]} (up to 32) sets the '/' menu
   (checked 2026-09-25; whether ``name`` takes the leading '/' is not documented).
@@ -31,6 +33,7 @@ import ssl
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -49,6 +52,7 @@ UPDATE_TYPES: tuple[str, ...] = (
     "message_callback",
 )
 DEFAULT_TIMEOUT = 30.0
+WEBHOOK_PATH_PREFIX = "/max/webhook/"  # app.config.Config.webhook_path
 
 # --- errors ----------------------------------------------------------------------------------
 
@@ -216,7 +220,10 @@ class MaxApi(Protocol):
 
     async def list_subscriptions(self) -> list[Subscription]: ...
 
-    async def subscribe(self, url: str, types: Sequence[str], secret: str) -> None: ...
+    async def subscribe(self, url: str, types: Sequence[str], secret: str) -> None:
+        """Create the subscription, or update the one with this URL."""
+
+    async def unsubscribe(self, url: str) -> None: ...
 
     async def get_updates(self, marker: int | None, timeout: int) -> UpdatesPage: ...
 
@@ -334,6 +341,9 @@ class HttpMaxApi:
     async def subscribe(self, url: str, types: Sequence[str], secret: str) -> None:
         await self._request("POST", "/subscriptions", body={"url": url, "update_types": list(types), "secret": secret})
 
+    async def unsubscribe(self, url: str) -> None:
+        await self._request("DELETE", "/subscriptions", params={"url": url})
+
     async def get_updates(self, marker: int | None, timeout: int) -> UpdatesPage:
         timeout = max(0, min(90, timeout))
         data = await self._request(
@@ -349,12 +359,24 @@ class HttpMaxApi:
         )
 
 
-async def ensure_subscription(api: MaxApi, url: str, secret: str) -> bool:
-    """Make sure our webhook subscription exists. Returns True when it had to be (re)created."""
-    if any(subscription.url == url for subscription in await api.list_subscriptions()):
-        return False
-    await api.subscribe(url, UPDATE_TYPES, secret)
-    return True
+async def ensure_subscription(api: MaxApi, url: str, secret: str, *, refresh: bool = False) -> bool:
+    """Make sure MAX sends our updates to ``url`` with ``secret``. Returns True when ours was missing.
+
+    GET /subscriptions never shows the secret, so ``refresh`` (used at startup) posts the
+    subscription again even when it is listed: POST /subscriptions also updates an existing
+    one, which is how a changed MAX_WEBHOOK_SECRET reaches MAX. A listed subscription with
+    other update types is posted again too. Subscriptions to older addresses of this bot
+    (another path secret or domain under /max/webhook/) are removed.
+    """
+    subscriptions = await api.list_subscriptions()
+    ours = next((subscription for subscription in subscriptions if subscription.url == url), None)
+    for stale in subscriptions:
+        if stale.url != url and urlsplit(stale.url).path.startswith(WEBHOOK_PATH_PREFIX):
+            await api.unsubscribe(stale.url)
+            log.warning("an old webhook subscription of this bot was removed")  # the URL holds a secret
+    if refresh or ours is None or set(ours.update_types) != set(UPDATE_TYPES):
+        await api.subscribe(url, UPDATE_TYPES, secret)
+    return ours is None
 
 
 def _query_value(value: Any) -> str:

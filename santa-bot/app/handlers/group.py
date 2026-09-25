@@ -17,6 +17,7 @@ from app import repo
 from app.context import AppContext
 from app.core.analytics import Event, record
 from app.core.games import ACTIVE, Reveal
+from app.core.models import Game
 from app.handlers import views
 from app.max_api import BotAdded, BotRemoved, Target
 
@@ -37,6 +38,15 @@ async def on_bot_removed(ctx: AppContext, update: BotRemoved) -> None:
 async def card_changed(ctx: AppContext, game_id: int) -> None:
     """Something the card shows changed (people, limit, status, title…): post or edit it."""
     await ctx.debouncer.run(("group_card", game_id), CARD_INTERVAL, lambda: _refresh_card(ctx, game_id))
+
+
+async def card_erased(ctx: AppContext, game: Game) -> None:
+    """The game is being deleted (its organizer asked to delete their data): the card in the
+    chat stops listing names. Queued now, since the game row will be gone when it is sent."""
+    if game.group_chat_id is None or game.group_card_mid is None:
+        return
+    await ctx.outbox.enqueue_edit(Target.chat(game.group_chat_id), game.group_card_mid,
+                                  views.group_card(ctx.config, game, []))
 
 
 async def post_reveal(ctx: AppContext, revealed: Reveal) -> None:

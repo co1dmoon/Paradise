@@ -34,12 +34,27 @@ class NoUpgradeAvailable(GameError):
 
 @dataclass(frozen=True, slots=True)
 class PaymentOutcome:
+    """What applying a payment did.
+
+    ``excess_rub`` is the part of a Robokassa payment that bought nothing and has to be
+    refunded: all of it when the game was no longer collecting or already had this limit
+    (an old link paid after another upgrade), part of it when the link was priced before
+    another payment for the same game arrived. ``duplicates`` lists the paid InvIds when
+    the same tier was paid more than once (§5.6).
+    """
+
     payment: Payment
     game: Game | None
     activated: list[Participant]
     already_processed: bool = False
     duplicates: tuple[int, ...] = ()
     game_not_collecting: bool = False
+    excess_rub: int = 0
+
+    @property
+    def fully_excess(self) -> bool:
+        """The payment changed nothing: the payer is owed all of it back."""
+        return self.excess_rub > 0 and self.excess_rub >= self.payment.amount_rub
 
 
 def higher_tier(a: Tier, b: Tier) -> Tier:
@@ -122,10 +137,17 @@ async def refund_payment(db: Db, inv_id: int) -> Payment | None:
 
 
 async def _apply(db: Db, payment: Payment, prices: PriceList) -> PaymentOutcome:
-    """Raise tier and limit to the max of current and paid, then activate the queue in join order."""
+    """Raise tier and limit to the max of current and paid, then activate the queue in join order.
+
+    A game that stopped collecting (drawn or cancelled while the payer was on the payment
+    page) is left as it is: the payment is reported as excess, to be refunded.
+    """
     if payment.game_id is None:
         return PaymentOutcome(payment, None, [])
     game = await load_game(db, payment.game_id)
+    if game.status != GameStatus.COLLECTING:
+        return PaymentOutcome(payment, game, [], game_not_collecting=True, excess_rub=payment.amount_rub)
+    excess = await _excess(db, game, payment, prices)
     await repo.update_game(
         db,
         game.id,
@@ -144,5 +166,20 @@ async def _apply(db: Db, payment: Payment, prices: PriceList) -> PaymentOutcome:
         game=await load_game(db, game.id),
         activated=activated,
         duplicates=duplicate_ids,
-        game_not_collecting=game.status != GameStatus.COLLECTING,
+        excess_rub=excess,
     )
+
+
+async def _excess(db: Db, game: Game, payment: Payment, prices: PriceList) -> int:
+    """Rubles of a Robokassa payment beyond what its tier costs (§4: price minus the sum already paid).
+
+    The amount of a payment row is fixed when the link is made, so a link opened before
+    another upgrade of the same game was paid charges too much, or (when the game already
+    has this limit) buys nothing at all. ``payment`` is already counted in the paid sum.
+    """
+    if payment.provider != PaymentProvider.ROBOKASSA:
+        return 0
+    if prices.limit_for(payment.tier) <= game.participant_limit:
+        return payment.amount_rub
+    overpaid = await repo.paid_sum(db, game.id) - prices.offer(payment.tier).price
+    return min(payment.amount_rub, max(0, overpaid))

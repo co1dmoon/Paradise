@@ -92,7 +92,7 @@ async def test_relays_after_30_days_and_closed_reports(db: Database) -> None:
     assert await repo.get_relay(db, stale.id) is None and await repo.get_relay(db, fresh.id) is not None
     assert await repo.get_report(db, closed.id) is None
     waiting = await repo.get_report(db, still_open.id)
-    assert waiting is not None and waiting.relay_id is None
+    assert waiting is not None and waiting.relay_id is None and waiting.text == "", "the quote goes after 30 days"
 
 
 async def test_unconsented_after_7_days_and_users_without_games_for_a_year(db: Database) -> None:
