@@ -31,11 +31,6 @@ from tools.fake_max import FakeMaxApi
 RESULT = "/pay/robokassa/result"
 
 
-@pytest.fixture
-def bot(ctx: AppContext, api: FakeMaxApi) -> Bot:
-    return Bot(ctx, api)
-
-
 async def events(ctx: AppContext, kind: str) -> int:
     return int(await ctx.db.fetchval("SELECT COUNT(*) FROM events WHERE type = ?", (kind,)))
 

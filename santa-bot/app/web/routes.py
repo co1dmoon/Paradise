@@ -12,6 +12,7 @@ compared in constant time, and a mismatch looks exactly like a missing page (404
 from __future__ import annotations
 
 import hmac
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
@@ -24,7 +25,9 @@ from app.payments import robokassa
 from app.updates import process_update
 from app.web import export, pages
 
-Handler = Callable[[web.Request], Awaitable[web.Response]]
+log = logging.getLogger(__name__)
+
+Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 
 JINJA_KEY = web.AppKey("jinja", jinja2.Environment)
 COUNTER_KEY = web.AppKey("draw_counter", pages.DrawCounter)
@@ -44,6 +47,7 @@ def register(app: web.Application) -> None:
     """Add the site's routes, static files and security headers to ``app``."""
     app[JINJA_KEY] = pages.environment()
     app[COUNTER_KEY] = pages.DrawCounter()
+    app.middlewares.append(_report_errors)
     app.on_response_prepare.append(_security_headers)
     router = app.router
     router.add_get("/", landing)
@@ -211,7 +215,27 @@ async def admin_export(request: web.Request) -> web.StreamResponse:
     )
 
 
-# --- security headers ------------------------------------------------------------------------------
+# --- errors and security headers --------------------------------------------------------------------
+
+
+@web.middleware
+async def _report_errors(request: web.Request, handler: Handler) -> web.StreamResponse:
+    """An unhandled exception becomes a plain 500 and an admin alert (at most once per 5 minutes).
+
+    Only the route pattern is logged: the webhook path itself contains a secret.
+    """
+    try:
+        return await handler(request)
+    except web.HTTPException:
+        raise
+    except Exception as error:
+        resource = request.match_info.route.resource
+        route = resource.canonical if resource is not None else "?"
+        log.exception("request failed", extra={"method": request.method, "route": route})
+        await _ctx(request).alerts.error(f"{type(error).__name__} на сайте ({request.method} {route})")
+        raise web.HTTPInternalServerError() from None
+
+
 
 
 async def _security_headers(request: web.Request, response: web.StreamResponse) -> None:

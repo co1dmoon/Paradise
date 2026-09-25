@@ -83,10 +83,11 @@ def create_app(
             poller.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await poller
-        await ctx.outbox.stop()
         await ctx.wait_background()
+        await ctx.outbox.stop()
         await ctx.api.close()
         await ctx.db.close()
+        log.info("stopped")
 
     app.cleanup_ctx.append(lifecycle)
     routes.register(app)
@@ -113,7 +114,7 @@ async def _check_identity(ctx: AppContext) -> None:
     try:
         me = await ctx.api.get_me()
     except Unauthorized:
-        log.error(texts.TOKEN_REJECTED)
+        await ctx.alerts.token_rejected()
         return
     except MaxApiError as error:
         log.warning("GET /me failed", extra={"error": str(error)})
@@ -128,6 +129,9 @@ async def _check_identity(ctx: AppContext) -> None:
 async def _ensure_webhook(ctx: AppContext) -> None:
     try:
         created = await ensure_subscription(ctx.api, ctx.config.webhook_url, ctx.config.max_webhook_secret)
+    except Unauthorized:
+        await ctx.alerts.token_rejected()
+        return
     except MaxApiError as error:
         log.error("webhook subscription failed", extra={"error": str(error)})
         return
@@ -147,11 +151,18 @@ async def _warn_about_webhook(ctx: AppContext) -> None:
 
 
 async def _poll(ctx: AppContext) -> None:
-    """MODE=polling, for local manual tests only (the docs say not for production)."""
+    """MODE=polling, for local manual tests only (the docs say not for production).
+
+    Updates of one page are processed in order, like a webhook batch.
+    """
     marker: int | None = None
     while True:
         try:
             page = await ctx.api.get_updates(marker, POLL_TIMEOUT)
+        except Unauthorized:
+            await ctx.alerts.token_rejected()
+            await asyncio.sleep(POLL_ERROR_PAUSE)
+            continue
         except MaxApiError as error:
             log.warning("polling failed", extra={"error": str(error)})
             await asyncio.sleep(POLL_ERROR_PAUSE)
@@ -159,7 +170,7 @@ async def _poll(ctx: AppContext) -> None:
         if page.marker is not None:
             marker = page.marker
         for raw in page.updates:
-            ctx.spawn(process_update(ctx, raw), name="update")
+            await process_update(ctx, raw)
 
 
 def main() -> None:

@@ -171,11 +171,12 @@ class Database:
             return False
 
     async def backup_to(self, target: str | Path) -> None:
-        """Online backup (consistent snapshot) into ``target``."""
+        """Online backup (consistent snapshot) into ``target``, as one self-contained file (no WAL)."""
         async with self._lock:
             target_conn = await aiosqlite.connect(str(target))
             try:
                 await self._conn.backup(target_conn)
+                await target_conn.execute("PRAGMA journal_mode=DELETE")
             finally:
                 await target_conn.close()
 

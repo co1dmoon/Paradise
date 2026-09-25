@@ -21,9 +21,19 @@ from app.core import kb, texts
 from app.core.dates import format_date_button, suggest_dates
 from app.core.games import GameCounts
 from app.core.kb import Button
-from app.core.models import Game, GameStatus, Participant, ParticipantStatus, Relay, RelayDirection, Report, Settings
+from app.core.models import (
+    Game,
+    GameStatus,
+    Participant,
+    ParticipantStatus,
+    Payment,
+    Relay,
+    RelayDirection,
+    Report,
+    Settings,
+)
 from app.core.payloads import deep_link, join_payload
-from app.core.pricing import Upgrade
+from app.core.pricing import PAID_TIERS, Upgrade
 from app.max_api import OutMessage
 
 
@@ -91,6 +101,10 @@ class Action(StrEnum):
     REF = "ref"
     BLOCK_REPORTED = "rb"
     CLOSE_REPORT = "rc"
+    UNBLOCK = "ub"
+    ADMIN_GRANT = "ag"
+    ADMIN_CANCEL = "ac"
+    ADMIN_CANCEL_CONFIRM = "acy"
 
 
 def button(text: str, action: Action, *args: str | int) -> kb.CallbackButton:
@@ -481,6 +495,36 @@ def pay_offer(game: Game, amount: int, limit: int, url: str) -> OutMessage:
     )
 
 
+# --- §5.9 notices the scheduler sends to organizers and participants --------------------------------
+
+
+def join_notice(game: Game, names: Sequence[str], active: int) -> OutMessage:
+    """§5.4: who joined since the last notice (at most one per 10 minutes)."""
+    text = texts.join_notice(title=game.title, names=names, active=active, limit=game.participant_limit)
+    return OutMessage(text, kb.keyboard(panel_button(game.id)))
+
+
+def waiting_notice(game: Game, waiting_count: int, upgrade: Upgrade | None) -> OutMessage:
+    """§5.6: people are queued (at most one per hour); ``upgrade`` is None when nobody can pay."""
+    if upgrade is None:
+        return OutMessage(texts.waiting_notice_full(title=game.title, waiting=waiting_count),
+                          kb.keyboard(panel_button(game.id)))
+    text = texts.waiting_notice(title=game.title, waiting=waiting_count, limit=upgrade.limit, price=upgrade.amount)
+    return OutMessage(text, kb.keyboard(upgrade_button(game.id)))
+
+
+def organizer_nudge(game: Game, days: int, active: int) -> OutMessage:
+    """§5.9 b: the exchange is close and there was no draw yet."""
+    return OutMessage(texts.organizer_nudge(title=game.title, days=days, active=active),
+                      kb.keyboard(draw_button(game.id)))
+
+
+def pre_exchange_reminder(game: Game, receiver: Participant) -> OutMessage:
+    """§5.9 c: the day before the exchange, at 12:00."""
+    return OutMessage(texts.pre_exchange_reminder(title=game.title, receiver=receiver.display_name),
+                      kb.keyboard(whom_button(game.id)))
+
+
 def wish_reminder(game: Game) -> OutMessage:
     return OutMessage(
         texts.wish_reminder(game.title),
@@ -528,4 +572,34 @@ def report_to_admins(report: Report, code: str | None) -> OutMessage:
                               reported_id=report.reported_id, text=report.text),
         kb.keyboard([button(texts.BTN_BLOCK_SENDER, Action.BLOCK_REPORTED, report.id),
                      button(texts.BTN_CLOSE_REPORT, Action.CLOSE_REPORT, report.id)]),
+    )
+
+
+# --- §9 admin -----------------------------------------------------------------------------------------
+
+
+def unblock_button(user_id: int) -> kb.CallbackButton:
+    return button(texts.BTN_UNBLOCK, Action.UNBLOCK, user_id)
+
+
+def admin_game(game: Game, counts: GameCounts, payments: Sequence[Payment]) -> OutMessage:
+    """/game CODE: the summary (never wishes or messages) with [Выдать S/M/L] [Отменить игру]."""
+    text = texts.admin_game_summary(
+        code=game.code, title=game.title, status=game.status, tier=game.tier, active=counts.active,
+        limit=game.participant_limit, waiting=counts.waiting, organizer_id=game.organizer_id,
+        created_at=game.created_at,
+        payments=[(p.inv_id, p.tier, p.amount_rub, p.status) for p in payments],
+    )
+    rows: list[Sequence[Button] | Button] = []
+    if game.status == GameStatus.COLLECTING:
+        rows.append([button(texts.btn_grant(tier), Action.ADMIN_GRANT, game.id, tier) for tier in PAID_TIERS])
+    if game.status in (GameStatus.COLLECTING, GameStatus.DRAWN):
+        rows.append(button(texts.BTN_ADMIN_CANCEL_GAME, Action.ADMIN_CANCEL, game.id))
+    return OutMessage(text, kb.keyboard(*rows) if rows else None)
+
+
+def confirm_admin_cancel(game: Game) -> OutMessage:
+    return OutMessage(
+        texts.confirm_admin_cancel(code=game.code, title=game.title),
+        kb.keyboard(button(texts.BTN_CONFIRM_CANCEL_GAME, Action.ADMIN_CANCEL_CONFIRM, game.id)),
     )

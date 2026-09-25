@@ -402,6 +402,9 @@ async def payment_return(s: Session, inv_id: int) -> None:
     if payment.status == PaymentStatus.CREATED:
         await s.say(texts.PAYMENT_PENDING)
     await open_game(s, game.id)
+    me = await repo.get_participant(s.db, game.id, s.user_id)
+    if me is not None and me.status == ACTIVE and not me.wishes and game.status == GameStatus.COLLECTING:
+        await ask_for_wishes(s, game.id)
 
 
 # --- §5.7 anonymous messages ------------------------------------------------------------------------------

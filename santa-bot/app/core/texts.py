@@ -301,7 +301,7 @@ EXCLUSIONS_PROMPT = "Кто не должен дарить друг другу (
 
 
 def pick_second_excluded(first: str) -> str:
-    return f"Кто не должен дарить друг другу с {first}? Выберите второго человека."
+    return f"Первый в паре: {first}. Выберите второго человека."
 
 
 def exclusions_list(pairs: Sequence[tuple[str, str]]) -> str:
@@ -489,6 +489,11 @@ def waiting_notice(*, title: str, waiting: int, limit: int, price: int) -> str:
         f"В игру {_q(title)} хотят вступить ещё {waiting} чел., но мест нет. "
         f"Расширить до {limit} — {price} ₽."
     )
+
+
+def waiting_notice_full(*, title: str, waiting: int) -> str:
+    """The waiting notice when the game cannot grow any more (top tier or payments off)."""
+    return f"В игру {_q(title)} хотят вступить ещё {waiting} чел., но мест нет."
 
 
 BTN_UPGRADE_SHORT = "Расширить"
@@ -758,6 +763,24 @@ def btn_grant(tier: str) -> str:
 
 
 BTN_ADMIN_CANCEL_GAME = "Отменить игру"
+ADMIN_GAME_CLOSED = "Игра уже отменена или завершена — это действие недоступно."
+
+
+def confirm_admin_cancel(*, code: str, title: str) -> str:
+    return f"Отменить игру {code} {_q(title)}? Участники и организатор получат уведомление. Это нельзя вернуть."
+
+
+def admin_game_cancelled(code: str) -> str:
+    return f"Игра {code} отменена, участники получили уведомление."
+
+
+def game_cancelled_by_service(*, title: str, support_email: str) -> str:
+    return f"Игра {_q(title)} отменена администрацией сервиса. Вопросы: {support_email}."
+
+
+def game_upgraded(*, title: str, limit: int) -> str:
+    """To the organizer after /grant (a manual payment, e.g. a bank transfer)."""
+    return f"Игра {_q(title)} расширена до {limit} участников."
 
 
 def granted(*, code: str, tier: str, limit: int) -> str:
@@ -769,6 +792,12 @@ def refunded(inv_id: int) -> str:
 
 
 PAYMENT_NOT_FOUND = "Платёж не найден."
+
+
+def payment_not_refundable(*, inv_id: int, status: str) -> str:
+    return f"Платёж {inv_id} в статусе {status}: вернуть можно только оплаченный (paid) или выданный (granted)."
+
+
 ADMIN_GAME_NOT_FOUND = "Игра не найдена."
 
 
@@ -800,8 +829,22 @@ def user_unblocked(user_id: int) -> str:
 
 
 USER_NOT_FOUND = "Пользователь не найден."
+BTN_UNBLOCK = "Разблокировать"
 MAINTENANCE_ON = "Режим технических работ включён: новые игры и вступления временно закрыты."
 MAINTENANCE_OFF = "Режим технических работ выключен."
+
+
+ADMIN_HELP = (
+    "Команды администратора:\n"
+    "/stats — статистика за сегодня, 7 дней и сезон\n"
+    "/game КОД — сводка по игре, выдать тариф, отменить игру\n"
+    "/grant КОД S|M|L [сумма] — расширить игру вручную (оплата по счёту)\n"
+    "/refund INVID — отметить платёж возвращённым\n"
+    "/price — цены; /price S 490, /price free 10, /price limit_S 30 — изменить\n"
+    "/block USERID, /unblock USERID — блокировка\n"
+    "/maintenance on|off — технические работы\n"
+    "/whoami — ваш id"
+)
 
 
 def digest(*, yesterday: StatsBlock, today: StatsBlock) -> str:
@@ -832,8 +875,10 @@ def username_mismatch(*, actual: str, configured: str) -> str:
 
 
 def certificate_expiring(*, name: str, expires: date, days: int) -> str:
+    when = f"{format_date(expires)} {expires.year}"
+    status = f"истекает {when} (через {days} дн.)" if days > 0 else f"истёк {when}"
     return (
-        f"Сертификат {name} истекает {format_date(expires)} {expires.year} (через {days} дн.). "
+        f"Сертификат {name} {status}. "
         "Скачайте новый с gu-st.ru, положите в certs/ и пересоберите бота."
     )
 

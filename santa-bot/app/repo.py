@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from app.core.clock import to_iso
+from app.core.clock import from_iso, to_iso
 from app.core.models import (
     SETTING_KEYS,
     Game,
@@ -110,6 +110,18 @@ async def set_state(
         " data = excluded.data, expires_at = excluded.expires_at",
         (user_id, kind, game_id, json.dumps(dict(data or {}), ensure_ascii=False), to_iso(now + STATE_TTL)),
     )
+
+
+async def set_state_if_idle(db: Db, user_id: int, kind: StateKind, now: datetime, *, game_id: int) -> bool:
+    """Like ``set_state``, unless another input is still pending (someone else's action must not
+    interrupt what the user is typing). Returns whether the state was set."""
+    result = await db.execute(
+        "INSERT INTO user_state (user_id, kind, game_id, data, expires_at) VALUES (?, ?, ?, '{}', ?)"
+        " ON CONFLICT (user_id) DO UPDATE SET kind = excluded.kind, game_id = excluded.game_id,"
+        " data = excluded.data, expires_at = excluded.expires_at WHERE user_state.expires_at <= ?",
+        (user_id, kind, game_id, to_iso(now + STATE_TTL), to_iso(now)),
+    )
+    return result.rowcount == 1
 
 
 async def get_state(db: Db, user_id: int, now: datetime) -> UserState | None:
@@ -558,3 +570,60 @@ async def prune_processed_updates(db: Db, before: datetime) -> int:
     result = await db.execute("DELETE FROM processed_updates WHERE ts < ?", (to_iso(before),))
     return result.rowcount
 
+
+
+# --- scheduler (§10) ---------------------------------------------------------------
+
+
+async def job_runs(db: Db) -> dict[str, datetime]:
+    """When each periodic job last ran."""
+    rows = await db.fetchall("SELECT name, last_run_at FROM job_runs")
+    return {row["name"]: from_iso(row["last_run_at"]) for row in rows}
+
+
+async def record_job_run(db: Db, name: str, at: datetime) -> None:
+    await db.execute(
+        "INSERT INTO job_runs (name, last_run_at) VALUES (?, ?)"
+        " ON CONFLICT (name) DO UPDATE SET last_run_at = excluded.last_run_at",
+        (name, to_iso(at)),
+    )
+
+
+_NOTICE_COLUMNS = {
+    ParticipantStatus.ACTIVE: "last_join_notice_at",
+    ParticipantStatus.WAITING: "last_waiting_notice_at",
+}
+
+
+async def games_with_newcomers(db: Db, status: ParticipantStatus, noticed_before: datetime) -> list[Game]:
+    """Collecting games where someone other than the organizer got ``status`` (active: joined,
+    waiting: queued) after the last notice of that kind, if that notice is older than
+    ``noticed_before`` (§5.4, §5.6 throttling)."""
+    column = _NOTICE_COLUMNS[status]
+    rows = await db.fetchall(
+        f"SELECT * FROM games g WHERE g.status = 'collecting' AND (g.{column} IS NULL OR g.{column} <= ?)"
+        " AND EXISTS (SELECT 1 FROM participants p WHERE p.game_id = g.id AND p.status = ?"
+        f" AND p.user_id <> g.organizer_id AND p.joined_at > COALESCE(g.{column}, '')) ORDER BY g.id",
+        (to_iso(noticed_before), status),
+    )
+    return [from_row(Game, row) for row in rows]
+
+
+async def games_to_nudge(db: Db, first: date, last: date) -> list[Game]:
+    """Collecting games not nudged yet whose exchange date is between ``first`` and ``last`` (§5.9 b)."""
+    rows = await db.fetchall(
+        "SELECT * FROM games WHERE status = 'collecting' AND org_nudge_sent = 0"
+        " AND exchange_date BETWEEN ? AND ? ORDER BY id",
+        (first.isoformat(), last.isoformat()),
+    )
+    return [from_row(Game, row) for row in rows]
+
+
+async def games_to_remind(db: Db, exchange_date: date) -> list[Game]:
+    """Drawn games with the reminder on, not reminded yet, exchanging on ``exchange_date`` (§5.9 c)."""
+    rows = await db.fetchall(
+        "SELECT * FROM games WHERE status = 'drawn' AND reminder_on = 1 AND pre_exchange_sent = 0"
+        " AND exchange_date = ? ORDER BY id",
+        (exchange_date.isoformat(),),
+    )
+    return [from_row(Game, row) for row in rows]

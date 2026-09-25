@@ -35,11 +35,6 @@ def external_urls(html: str, own_base: str) -> list[str]:
 
 
 @pytest.fixture
-def bot(ctx: AppContext, api: FakeMaxApi) -> Bot:
-    return Bot(ctx, api)
-
-
-@pytest.fixture
 async def metrica_ctx(env: dict[str, str], api: FakeMaxApi, clock: FakeClock) -> AsyncIterator[AppContext]:
     config = load_config({**env, "METRICA_ID": "12345678"}, announce=lambda _: None)
     context = await build_context(config, api=api, clock=clock)

@@ -15,6 +15,7 @@ from app.core.clock import FakeClock
 from app.core.models import User
 from app.db import Database
 from app.main import build_context
+from tests.bot import Bot
 from tests.helpers import consented_user
 from tools.fake_max import FakeMaxApi
 
@@ -75,6 +76,12 @@ async def ctx(config: Config, api: FakeMaxApi, clock: FakeClock, rng: random.Ran
     yield context
     await context.wait_background()
     await context.db.close()
+
+
+@pytest.fixture
+def bot(ctx: AppContext, api: FakeMaxApi) -> Bot:
+    """Drives updates through ``process_update``; handler errors fail the test (see tests/bot.py)."""
+    return Bot(ctx, api)
 
 
 @pytest.fixture

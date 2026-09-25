@@ -10,7 +10,8 @@ worker. Interactive replies are sent directly (``send_now``, ``edit_now``,
   one-per-second lane for callback answers, so a dialog never exceeds MAX's 2/s.
 
 Failures: 429/transient errors (and 401, which is usually a config mistake being
-fixed) retry after 2, 5, 15, 60, 180 and 600 s, then the row is dead. Forbidden
+fixed, and alerts the admins) retry after 2, 5, 15, 60, 180 and 600 s, then the
+row is dead. Forbidden
 to a user sets ``users.dm_ok = 0``. Every final outcome reaches ``OutboxHooks``
 (see ``app.delivery``), which tracks draw results and alerts the admins.
 
@@ -105,6 +106,9 @@ class OutboxHooks(Protocol):
 
     async def on_failed(self, target: Target, error: MaxApiError, item: OutboxItem | None) -> None:
         """A final failure: a dead outbox row, or a failed direct send (``item`` is None)."""
+
+    async def on_unauthorized(self) -> None:
+        """MAX rejected the bot token (401); the message will be retried."""
 
 
 class Outbox:
@@ -213,6 +217,8 @@ class Outbox:
         except _RETRYABLE as error:
             log.warning("direct send failed, queued for retry", extra={"target": target.key, "error": str(error)})
             await self.enqueue(target, message, disable_preview=disable_preview, delay=RETRY_DELAYS[0])
+            if isinstance(error, Unauthorized) and self.hooks is not None:
+                await self.hooks.on_unauthorized()
         except MaxApiError as error:
             await self._final_failure(target, error, None)
         return None
@@ -333,8 +339,8 @@ class Outbox:
 
     async def _retry(self, item: OutboxItem, error: MaxApiError) -> None:
         attempts = item.attempts + 1
-        if isinstance(error, Unauthorized):
-            log.error("MAX rejected the bot token (401): check MAX_BOT_TOKEN")
+        if isinstance(error, Unauthorized) and self.hooks is not None:
+            await self.hooks.on_unauthorized()
         if attempts > len(RETRY_DELAYS):
             await self._db.execute(
                 "UPDATE outbox SET status = 'dead', attempts = ?, last_error = ? WHERE id = ?",

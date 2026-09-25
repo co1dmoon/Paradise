@@ -19,6 +19,7 @@ from app.outbox import PURPOSE_ALERT, Outbox
 log = logging.getLogger(__name__)
 
 ERROR_ALERT_INTERVAL = 5 * 60.0
+TOKEN_ALERT_INTERVAL = 60 * 60.0
 
 
 @dataclass(slots=True)
@@ -62,3 +63,12 @@ class Alerter:
         self._throttles[key] = _Throttle(last_sent=now)
         await self.notify_admins(texts.with_suppressed(text, suppressed))
         return True
+
+    async def error(self, summary: str) -> bool:
+        """An unhandled exception (handlers, jobs, web): one alert per 5 minutes for all errors."""
+        return await self.alert("error", texts.error_alert(summary))
+
+    async def token_rejected(self) -> bool:
+        """MAX answered 401 (§9). The alert is queued and arrives once the token works again."""
+        log.error("MAX rejected the bot token (401): check MAX_BOT_TOKEN")
+        return await self.alert("unauthorized", texts.TOKEN_REJECTED, min_interval=TOKEN_ALERT_INTERVAL)

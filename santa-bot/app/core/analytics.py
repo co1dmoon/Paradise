@@ -98,6 +98,12 @@ def stats_periods(now: datetime, tz: ZoneInfo) -> list[Period]:
     ]
 
 
+async def collect_day(db: Db, day: date, tz: ZoneInfo) -> StatsBlock:
+    """The numbers of one local (Moscow) calendar day, for the daily digest (§9)."""
+    start = datetime.combine(day, time(), tzinfo=tz)
+    return await collect_stats(db, start, start + timedelta(days=1))
+
+
 async def build_stats_report(db: Db, now: datetime, tz: ZoneInfo) -> StatsReport:
     periods = stats_periods(now, tz)
     week = periods[1]

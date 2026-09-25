@@ -10,6 +10,7 @@ from aiohttp.test_utils import TestServer
 from app import repo
 from app.config import Config, load_config
 from app.context import CTX_KEY, AppContext
+from app.core import texts
 from app.core.clock import FakeClock
 from app.handlers import router
 from app.main import create_app
@@ -81,3 +82,4 @@ async def test_handler_errors_alert_admins_throttled(
     await ctx.outbox.drain()
     alerts = api.texts_to(9000)
     assert len(alerts) == 1 and "ValueError" in alerts[0] and "boom" not in alerts[0]
+    assert api.texts_to(5) == [texts.SOMETHING_WENT_WRONG] * 3

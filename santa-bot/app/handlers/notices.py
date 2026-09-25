@@ -1,8 +1,9 @@
-"""Messages to people other than the one who acted, queued through the outbox (§5.4–§5.6).
+"""Messages to people other than the one who acted, queued through the outbox (§5.4–§5.6, §5.9).
 
 Queued messages survive restarts and respect the rate limits. Dedupe keys make
 the payment notices idempotent, so the ResultURL handler may call
-``payment_applied`` for every confirmation it processes.
+``payment_applied`` for every confirmation it processes. The scheduler's notices
+take ``db`` so they are queued in the same transaction that records them as sent.
 """
 
 from __future__ import annotations
@@ -14,22 +15,31 @@ from app.context import AppContext
 from app.core import texts
 from app.core.billing import PaymentOutcome
 from app.core.games import DrawResult
-from app.core.models import Game, Participant
+from app.core.models import Game, Participant, StateKind
+from app.core.pricing import Upgrade
 from app.core.users import display_name_from_profile
+from app.db import Db
 from app.handlers import views
 from app.max_api import OutMessage, Target
 from app.outbox import PURPOSE_DRAW_RESULT
 
 
 async def _to(ctx: AppContext, user_id: int, message: OutMessage | str, *, dedupe_key: str | None = None,
-              game_id: int | None = None) -> None:
+              game_id: int | None = None, db: Db | None = None) -> None:
     body = OutMessage(message) if isinstance(message, str) else message
-    await ctx.outbox.enqueue(Target.user(user_id), body, disable_preview=True, dedupe_key=dedupe_key, game_id=game_id)
+    await ctx.outbox.enqueue(Target.user(user_id), body, disable_preview=True, dedupe_key=dedupe_key,
+                             game_id=game_id, db=db)
 
 
 async def participants_activated(ctx: AppContext, game: Game, activated: Sequence[Participant]) -> None:
-    """People moved from the queue into the game: 'Место появилось…' with a wishes prompt."""
+    """People moved from the queue into the game: 'Место появилось… Напишите, что хотели бы получить.'
+
+    Their next typed message becomes their wishes, unless they are typing something else.
+    """
     for participant in activated:
+        if not participant.wishes:
+            await repo.set_state_if_idle(ctx.db, participant.user_id, StateKind.WISHES, ctx.clock.now(),
+                                         game_id=game.id)
         await _to(ctx, participant.user_id, views.spot_opened(game), game_id=game.id)
 
 
@@ -40,6 +50,19 @@ async def participant_removed(ctx: AppContext, game: Game, person: Participant) 
 async def game_cancelled(ctx: AppContext, game: Game, people: Sequence[Participant]) -> None:
     for person in people:
         await _to(ctx, person.user_id, texts.game_cancelled(game.title), game_id=game.id)
+
+
+async def game_cancelled_by_service(ctx: AppContext, game: Game, people: Sequence[Participant]) -> None:
+    """An admin cancelled the game: everyone in it and the organizer are told."""
+    text = texts.game_cancelled_by_service(title=game.title, support_email=ctx.config.support_email)
+    for user_id in dict.fromkeys([game.organizer_id, *(person.user_id for person in people)]):
+        await _to(ctx, user_id, text, game_id=game.id)
+
+
+async def game_upgraded(ctx: AppContext, game: Game, *, db: Db) -> None:
+    """/grant: the organizer learns the game now takes more people."""
+    await _to(ctx, game.organizer_id, texts.game_upgraded(title=game.title, limit=game.participant_limit),
+              game_id=game.id, db=db)
 
 
 async def wish_reminders(ctx: AppContext, game: Game, people: Sequence[Participant]) -> None:
@@ -92,3 +115,29 @@ async def payer_name(ctx: AppContext, game: Game, user_id: int) -> str:
         return participant.display_name
     user = await repo.get_user(ctx.db, user_id)
     return display_name_from_profile(user.max_name if user else None)
+
+
+# --- §5.9 the scheduler's notices --------------------------------------------------------------------
+
+
+async def join_notice(ctx: AppContext, game: Game, newcomers: Sequence[Participant], active: int, *, db: Db) -> None:
+    names = [person.display_name for person in newcomers]
+    await _to(ctx, game.organizer_id, views.join_notice(game, names, active), game_id=game.id, db=db)
+
+
+async def waiting_notice(ctx: AppContext, game: Game, waiting: int, upgrade: Upgrade | None, *, db: Db) -> None:
+    await _to(ctx, game.organizer_id, views.waiting_notice(game, waiting, upgrade), game_id=game.id, db=db)
+
+
+async def organizer_nudge(ctx: AppContext, game: Game, days: int, active: int, *, db: Db) -> None:
+    await _to(ctx, game.organizer_id, views.organizer_nudge(game, days, active),
+              dedupe_key=f"nudge:{game.id}:{game.exchange_date}", game_id=game.id, db=db)
+
+
+async def pre_exchange_reminders(
+    ctx: AppContext, game: Game, pairs: Sequence[tuple[int, Participant]], *, db: Db
+) -> None:
+    """One reminder per giver: ``pairs`` are (giver id, receiver)."""
+    for giver_id, receiver in pairs:
+        await _to(ctx, giver_id, views.pre_exchange_reminder(game, receiver),
+                  dedupe_key=f"pre:{game.id}:{game.exchange_date}:{giver_id}", game_id=game.id, db=db)

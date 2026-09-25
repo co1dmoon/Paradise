@@ -1,7 +1,8 @@
 """FakeMaxApi: an in-memory MAX Bot API for offline tests and the simulator (§14).
 
-It records every send, edit and answer per target and offers helpers to read
-what a user saw and to build the updates MAX would deliver:
+It records every send, edit and answer per target (``timeline`` keeps every
+visible change in order) and offers helpers to read what a user saw and to
+build the updates MAX would deliver:
 
     api = FakeMaxApi()
     olga = FakeUser(api, 101, "Ольга")
@@ -16,6 +17,7 @@ for the next calls) and ``reject_notifications`` (MAX refusing the undocumented
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -80,6 +82,15 @@ class SentMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class Delivery:
+    """One visible change in a chat, in order: a new message, or a message replaced by an edit."""
+
+    record: SentMessage
+    body: OutMessage
+    edited: bool
+
+
+@dataclass(frozen=True, slots=True)
 class RecordedAnswer:
     callback_id: str
     notification: str | None
@@ -101,11 +112,13 @@ class FakeMaxApi:
         self._clock = clock
         self.bot = BotInfo(BOT_USER_ID, bot_username, "Санта в чате")
         self.sent: list[SentMessage] = []
+        self.timeline: list[Delivery] = []
         self.answers: list[RecordedAnswer] = []
         self.calls: list[RecordedCall] = []
         self.subscriptions: list[Subscription] = []
         self.chats: dict[int, ChatInfo] = {}
         self.pending_updates: list[dict[str, Any]] = []
+        self.poll_wait = 0.01
         self.reject_notifications = False
         self._blocked_users: set[int] = set()
         self._failures: list[MaxApiError] = []
@@ -139,6 +152,7 @@ class FakeMaxApi:
         mid = f"mid.{_next_id():06d}"
         record = SentMessage(mid, target, message, disable_link_preview, self._now(), touched=next(self._touches))
         self.sent.append(record)
+        self.timeline.append(Delivery(record, message, edited=False))
         self._by_mid[mid] = record
         self.calls.append(RecordedCall("send", target.key, record.at))
         return mid
@@ -150,6 +164,7 @@ class FakeMaxApi:
             raise Forbidden(404, "message.not.found")
         record.edits.append(message)
         record.touched = next(self._touches)
+        self.timeline.append(Delivery(record, message, edited=True))
         self.calls.append(RecordedCall("edit", record.target.key, self._now()))
 
     async def answer(
@@ -161,8 +176,10 @@ class FakeMaxApi:
         self.answers.append(RecordedAnswer(callback_id, notification if shown else None, message, self._now()))
         mid = self._callback_mids.get(callback_id)
         if message is not None and mid in self._by_mid:
-            self._by_mid[mid].edits.append(message)
-            self._by_mid[mid].touched = next(self._touches)
+            record = self._by_mid[mid]
+            record.edits.append(message)
+            record.touched = next(self._touches)
+            self.timeline.append(Delivery(record, message, edited=True))
         return notification is None or shown
 
     async def get_chat(self, chat_id: int) -> ChatInfo:
@@ -179,6 +196,9 @@ class FakeMaxApi:
         self.subscriptions = [s for s in self.subscriptions if s.url != url] + [Subscription(url, tuple(types))]
 
     async def get_updates(self, marker: int | None, timeout: int) -> UpdatesPage:
+        """Long polling: an empty page comes back after ``poll_wait`` real seconds, not at once."""
+        if not self.pending_updates:
+            await asyncio.sleep(self.poll_wait)
         updates, self.pending_updates = self.pending_updates, []
         return UpdatesPage(updates, (marker or 0) + len(updates))
 
@@ -261,6 +281,7 @@ class FakeMaxApi:
     def clear(self) -> None:
         """Forget recorded messages and answers (not failures or subscriptions)."""
         self.sent.clear()
+        self.timeline.clear()
         self.answers.clear()
         self.calls.clear()
         self._by_mid.clear()

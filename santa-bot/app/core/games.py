@@ -485,9 +485,19 @@ async def cancel_game(db: Db, game_id: int, organizer_id: int, now: datetime) ->
     """Cancel the game; returns everyone to notify (active and waiting, except the organizer)."""
     async with db.transaction() as tx:
         await _load_organized(tx, game_id, organizer_id, GameStatus.COLLECTING, GameStatus.DRAWN)
-        await repo.update_game(tx, game_id, status=GameStatus.CANCELLED, cancelled_at=now)
-        people = await repo.participants(tx, game_id, ACTIVE, WAITING)
-        return [p for p in people if p.user_id != organizer_id]
+        return [p for p in await _cancel(tx, game_id, now) if p.user_id != organizer_id]
+
+
+async def cancel_game_as_admin(db: Db, game_id: int, now: datetime) -> list[Participant]:
+    """An admin cancels any collecting or drawn game (/game); returns everyone active or waiting."""
+    async with db.transaction() as tx:
+        require_status(await load_game(tx, game_id), GameStatus.COLLECTING, GameStatus.DRAWN)
+        return await _cancel(tx, game_id, now)
+
+
+async def _cancel(db: Db, game_id: int, now: datetime) -> list[Participant]:
+    await repo.update_game(db, game_id, status=GameStatus.CANCELLED, cancelled_at=now)
+    return await repo.participants(db, game_id, ACTIVE, WAITING)
 
 
 async def add_exclusion(db: Db, game_id: int, organizer_id: int, a: int, b: int) -> bool:

@@ -80,3 +80,18 @@ def format_date(value: date) -> str:
 def format_date_button(value: date) -> str:
     """'20.12, сб' — short form for buttons."""
     return f"{value:%d.%m}, {_WEEKDAYS_SHORT[value.weekday()]}"
+
+
+def in_season_window(day: date, first: str, last: str) -> bool:
+    """Whether ``day`` lies between two 'MM-DD' marks, inclusive; the window may wrap the new year
+    (DIGEST_FROM=11-01, DIGEST_TO=01-10 covers November to January 10)."""
+    mark = (day.month, day.day)
+    start, end = _month_day(first), _month_day(last)
+    if start <= end:
+        return start <= mark <= end
+    return mark >= start or mark <= end
+
+
+def _month_day(text: str) -> tuple[int, int]:
+    month, day = text.split("-")
+    return int(month), int(day)

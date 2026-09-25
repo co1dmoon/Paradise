@@ -4,7 +4,7 @@
 duplicates (webhook retries), keeps ``users.dm_ok`` current, serializes each
 user's updates with a per-user lock and hands the typed update to
 ``app.handlers.router.dispatch``. Unhandled errors are logged and reported to
-the admins at most once per 5 minutes.
+the admins at most once per 5 minutes; the user is told that something went wrong.
 """
 
 from __future__ import annotations
@@ -21,6 +21,8 @@ from app.max_api import (
     BotStopped,
     CallbackQuery,
     MessageCreated,
+    OutMessage,
+    Target,
     Update,
     dedupe_key,
     parse_update,
@@ -50,8 +52,21 @@ async def process_update(ctx: AppContext, raw: dict[str, Any]) -> None:
             await router.dispatch(ctx, update)
     except Exception as error:
         log.exception("update failed", extra={"update_type": raw.get("update_type"), "user_id": user_id})
-        summary = f"{type(error).__name__} при обработке {raw.get('update_type')}"
-        await ctx.alerts.alert("error", texts.error_alert(summary))
+        await ctx.alerts.error(f"{type(error).__name__} при обработке {raw.get('update_type')}")
+        if user_id is not None and _is_private(update):
+            await ctx.outbox.send_now(Target.user(user_id), OutMessage(texts.SOMETHING_WENT_WRONG))
+
+
+def _is_private(update: Update) -> bool:
+    """Whether the update came from the user's private chat with the bot (never apologize in a group)."""
+    match update:
+        case BotStarted():
+            return True
+        case MessageCreated():
+            return update.is_private
+        case CallbackQuery():
+            return update.chat_type in (None, "dialog")
+    return False
 
 
 async def _track_reachability(ctx: AppContext, update: Update, user_id: int) -> None:

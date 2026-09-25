@@ -675,7 +675,8 @@ async def _block_reported(s: Session, args: Args) -> None:
         raise Outdated("no such report")
     await repo.set_blocked(s.db, report.reported_id, True)
     await repo.resolve_report(s.db, report.id)
-    await s.say(texts.user_blocked(report.reported_id))
+    await s.say(OutMessage(texts.user_blocked(report.reported_id),
+                           kb.keyboard(views.unblock_button(report.reported_id))))
 
 
 @on(Action.CLOSE_REPORT, admin_only=True)

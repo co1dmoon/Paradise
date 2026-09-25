@@ -1,4 +1,4 @@
-"""Outbox hooks: draw-result bookkeeping and admin alerts for rejected messages (§5.5, §10)."""
+"""Outbox hooks: draw-result bookkeeping and admin alerts for rejected messages and tokens (§5.5, §9, §10)."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ class DeliveryTracker:
     - A draw result (purpose ``draw_result``) sets participants.result_dm_ok; when the
       last result of a draw resolves, the organizer gets the 'Пары отправлены' summary.
     - BadRequest on a non-alert message is reported to the admins (throttled).
+    - A rejected token (401) is reported to the admins (throttled).
     """
 
     def __init__(self, db: Db, outbox: Outbox, alerts: Alerter, clock: Clock) -> None:
@@ -39,6 +40,9 @@ class DeliveryTracker:
                 texts.message_rejected(target=target.key, error=error.detail),
                 min_interval=BAD_REQUEST_ALERT_INTERVAL,
             )
+
+    async def on_unauthorized(self) -> None:
+        await self._alerts.token_rejected()
 
     async def _draw_result(self, item: OutboxItem, *, delivered: bool) -> None:
         if item.game_id is None or item.target.kind != "user":

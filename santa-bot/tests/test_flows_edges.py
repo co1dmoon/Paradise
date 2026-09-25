@@ -8,7 +8,6 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from app import repo
-from app.context import AppContext
 from app.core import billing, games, texts
 from app.core.clock import FakeClock
 from app.core.dates import DateError
@@ -20,11 +19,6 @@ from tests.helpers import consented_user
 from tools.fake_max import FakeMaxApi, FakeUser, message_created
 
 ORGANIZER = 100
-
-
-@pytest.fixture
-def bot(ctx: AppContext, api: FakeMaxApi) -> Bot:
-    return Bot(ctx, api)
 
 
 @pytest.fixture

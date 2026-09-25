@@ -5,18 +5,12 @@ from __future__ import annotations
 import pytest
 
 from app import repo
-from app.context import AppContext
 from app.core import texts
 from app.core.analytics import build_stats_report
 from app.core.models import GameStatus, JoinVia, ParticipantStatus, StateKind
 from app.handlers.views import Action
 from tests.bot import ADMIN_ID, Bot
 from tools.fake_max import FakeMaxApi
-
-
-@pytest.fixture
-def bot(ctx: AppContext, api: FakeMaxApi) -> Bot:
-    return Bot(ctx, api)
 
 
 async def organizer_with_game(bot: Bot, *, participates: bool = True):
