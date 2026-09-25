@@ -393,6 +393,8 @@ async def _send_report(ctx: AppContext, current: Snapshot, notes: Sequence[str],
     header = texts.promo_report_header(day=situation.today, dry=not current.settings.auto,
                                        spent_kop=situation.spent_total_kop, cap_kop=situation.cap_kop)
     lines = [_campaign_line(facts) for facts in current.facts] or [texts.PROMO_NO_CAMPAIGNS]
+    if any(_cpa(facts) != _decision_cpa(facts) for facts in current.facts):
+        lines.append(texts.promo_decision_note(lag_days=current.settings.lag_days))
     lines += [*notes, *(_outcome_line(outcome) for outcome in outcomes)]
     lines += await _links_and_channel_lines(ctx, current.settings)
     await ctx.alerts.notify_admins(texts.fit_lines(lines, header=header))
@@ -401,11 +403,20 @@ async def _send_report(ctx: AppContext, current: Snapshot, notes: Sequence[str],
             await ctx.alerts.notify_admins(_proposal_message(ctx, current, outcome))
 
 
+def _cpa(facts: CampaignFacts) -> int | None:
+    return facts.spend_total_kop // facts.games3 if facts.games3 else None
+
+
+def _decision_cpa(facts: CampaignFacts) -> int | None:
+    """The cost per game the rules decide on: matured spend and games only (PROMO_LAG_DAYS)."""
+    return facts.spend_matured_kop // facts.games3_matured if facts.games3_matured else None
+
+
 def _campaign_line(facts: CampaignFacts) -> str:
     return texts.promo_campaign_line(
         platform=facts.platform, name=facts.name, state=facts.state, paused_by=facts.paused_by,
         yesterday_kop=facts.spend_yesterday_kop, total_kop=facts.spend_total_kop, games3=facts.games3,
-        cpa_kop=facts.spend_total_kop // facts.games3 if facts.games3 else None, paid_rub=facts.paid_rub,
+        cpa_kop=_cpa(facts), decision_cpa_kop=_decision_cpa(facts), paid_rub=facts.paid_rub,
     )
 
 
@@ -485,7 +496,7 @@ def _status_line(ctx: AppContext, current: Snapshot, campaign: PromoCampaign) ->
     return texts.promo_status_line(
         platform=facts.platform, name=facts.name, src=facts.src, state=facts.state, paused_by=facts.paused_by,
         yesterday_kop=facts.spend_yesterday_kop, total_kop=facts.spend_total_kop, games3=facts.games3,
-        cpa_kop=facts.spend_total_kop // facts.games3 if facts.games3 else None, paid_rub=facts.paid_rub,
+        cpa_kop=_cpa(facts), decision_cpa_kop=_decision_cpa(facts), paid_rub=facts.paid_rub,
         downstream_games=current.metrics[facts.src].downstream_games, budget_kop=budget.kop if budget else None,
         kind=budget.kind if budget else None, limit_kop=facts.limit.kop if facts.limit else None,
         numbers_from=numbers_from,

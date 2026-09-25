@@ -317,6 +317,23 @@ async def test_the_report_counts_links_and_the_channel(ctx: AppContext, api: Fak
                            "Канал MAX: постов 1, пришло 1 чел., игр 1.")
 
 
+async def test_the_report_shows_the_cost_the_rules_decide_on(ctx: AppContext, api: FakeMaxApi, clock: FakeClock,
+                                                              direct: FakeAdPlatform) -> None:
+    """All-time spend includes days whose games are still growing; the rules use the matured numbers."""
+    direct.add("701", "Поиск", budget=Budget(3000_00, WEEK))
+    await autopilot.register(ctx, Platform.DIRECT, "701", "")
+    for day in range(24, 30):
+        direct.spend_on("701", date(2026, 11, day), 400_00)
+    await games_from(ctx.db, "yd701", 11, seen=msk(25, 14))
+    travel(clock, msk(30))
+
+    await autopilot.daily_job(ctx)
+
+    report = (await report_and_messages(ctx, api))[0]
+    assert "игр на 3+: 11 · 218 ₽ за игру (для решений 145 ₽) · " in report
+    assert texts.promo_decision_note(lag_days=2) in report
+
+
 async def test_nothing_to_report_sends_nothing(ctx: AppContext, api: FakeMaxApi) -> None:
     await autopilot.daily_job(ctx)
     assert await report_and_messages(ctx, api) == []

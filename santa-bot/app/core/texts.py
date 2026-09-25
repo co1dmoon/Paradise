@@ -1150,11 +1150,26 @@ def promo_report_header(*, day: date, dry: bool, spent_kop: int, cap_kop: int) -
     return f"Реклама — {format_date(day)}. Режим: {mode}.\nПотрачено всего {_rub(spent_kop)} ₽ из {_rub(cap_kop)} ₽."
 
 
+def _cpa_part(cpa_kop: int | None, decision_cpa_kop: int | None) -> str:
+    """Cost per game over all spend; the rules decide on the matured one, so show it too when it differs."""
+    part = f"{'—' if cpa_kop is None else _rub(cpa_kop)} ₽ за игру"
+    if decision_cpa_kop == cpa_kop:
+        return part
+    decided = "игр пока нет" if decision_cpa_kop is None else f"{_rub(decision_cpa_kop)} ₽"
+    return f"{part} (для решений {decided})"
+
+
+def promo_decision_note(*, lag_days: int) -> str:
+    return (f"«Для решений» — без последних {lag_days} дн.: свежие игры ещё набирают участников, "
+            f"поэтому паузу и подъём бюджета я считаю по более ранним дням.")
+
+
 def promo_campaign_line(*, platform: str, name: str, state: str, paused_by: str | None, yesterday_kop: int,
-                        total_kop: int, games3: int, cpa_kop: int | None, paid_rub: int) -> str:
-    cpa = "—" if cpa_kop is None else _rub(cpa_kop)
+                        total_kop: int, games3: int, cpa_kop: int | None, decision_cpa_kop: int | None,
+                        paid_rub: int) -> str:
     return (f"{_PROMO_PLATFORMS[platform]} «{name}»: вчера {_rub(yesterday_kop)} ₽, всего {_rub(total_kop)} ₽ · "
-            f"игр на 3+: {games3} · {cpa} ₽ за игру · оплат {paid_rub} ₽ · {_promo_state(state, paused_by)}")
+            f"игр на 3+: {games3} · {_cpa_part(cpa_kop, decision_cpa_kop)} · оплат {paid_rub} ₽ · "
+            f"{_promo_state(state, paused_by)}")
 
 
 def promo_paused_line(*, name: str, reason: str, dry: bool) -> str:
@@ -1396,11 +1411,10 @@ def promo_rules_summary(*, pause_cpa_rub: int, scale_cpa_rub: int, min_spend_rub
 
 
 def promo_status_line(*, platform: str, name: str, src: str, state: str, paused_by: str | None,
-                      yesterday_kop: int, total_kop: int, games3: int, cpa_kop: int | None, paid_rub: int,
-                      downstream_games: int, budget_kop: int | None, kind: str | None, limit_kop: int | None,
-                      numbers_from: str | None) -> str:
+                      yesterday_kop: int, total_kop: int, games3: int, cpa_kop: int | None,
+                      decision_cpa_kop: int | None, paid_rub: int, downstream_games: int, budget_kop: int | None,
+                      kind: str | None, limit_kop: int | None, numbers_from: str | None) -> str:
     """``numbers_from``: when the spend was last fetched, if that was too long ago ('' for never)."""
-    cpa = "—" if cpa_kop is None else _rub(cpa_kop)
     payback = f"{paid_rub * 10000 // total_kop}%" if total_kop else "—"
     budget = f"{_rub(budget_kop)} ₽ в {_PROMO_PERIODS[kind]}" if budget_kop is not None and kind else "не виден"
     if limit_kop is not None:
@@ -1413,8 +1427,9 @@ def promo_status_line(*, platform: str, name: str, src: str, state: str, paused_
     if numbers_from is not None:
         stale = f" · цифры от {numbers_from}" if numbers_from else " · расходы ещё не загружались"
     return (f"{_PROMO_PLATFORMS[platform]} «{name}» ({src}): {_promo_state(state, paused_by)} · вчера "
-            f"{_rub(yesterday_kop)} ₽, всего {_rub(total_kop)} ₽ · игр на 3+: {games3} · {cpa} ₽ за игру · "
-            f"оплат {paid_rub} ₽, окупаемость {payback}{spread} · бюджет {budget}{stale}")
+            f"{_rub(yesterday_kop)} ₽, всего {_rub(total_kop)} ₽ · игр на 3+: {games3} · "
+            f"{_cpa_part(cpa_kop, decision_cpa_kop)} · оплат {paid_rub} ₽, окупаемость {payback}{spread} · "
+            f"бюджет {budget}{stale}")
 
 
 def promo_waiting_proposal(*, name: str, to_kop: int) -> str:
