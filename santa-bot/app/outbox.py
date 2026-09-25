@@ -197,6 +197,15 @@ class Outbox:
     async def pending_count(self) -> int:
         return int(await self._db.fetchval("SELECT COUNT(*) FROM outbox WHERE status = 'pending'"))
 
+    async def cancel_pending(self, purpose: str, game_id: int, *, db: Db | None = None) -> int:
+        """Drop queued messages that no longer make sense (the old pairs after a redraw)."""
+        result = await (db or self._db).execute(
+            "UPDATE outbox SET status = 'dead', last_error = 'superseded'"
+            " WHERE status = 'pending' AND purpose = ? AND game_id = ?",
+            (purpose, game_id),
+        )
+        return result.rowcount
+
     async def prune(self, before: datetime) -> int:
         """Delete delivered and dead rows created before ``before``."""
         result = await self._db.execute(

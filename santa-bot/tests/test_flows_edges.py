@@ -193,9 +193,9 @@ async def test_buttons_of_a_drawn_game(bot: Bot, api: FakeMaxApi, clock, olga) -
     await games.run_draw(bot.ctx.db, game.id, ORGANIZER, now=clock.now(), rng=bot.ctx.rng)
 
     await bot(ivan.press(texts.BTN_LEAVE))
-    assert ivan.screen_text == texts.LEAVE_AFTER_DRAW
-    await bot.forge(olga, f"{Action.REMOVE_PICK}:{game.id}:0")
-    assert olga.screen_text == texts.ALREADY_DRAWN_ACTION
+    assert ivan.screen_text == texts.confirm_leave_after_draw(game.title)
+    await bot(ivan.press(texts.BTN_CANCEL))
+    assert ivan.screen_text.startswith(f"Игра «{game.title}» — жеребьёвка проведена")
     await bot.forge(olga, f"{Action.EXCLUSION_SECOND}:{game.id}:201:202")
     assert olga.screen_text == texts.ALREADY_DRAWN_ACTION
 

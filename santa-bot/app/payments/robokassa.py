@@ -25,6 +25,7 @@ exactly as received: OutSum has two decimals in test mode and six in live mode
 ``process_result`` verifies the notice, then marks the payment paid, applies the
 tier, records the event and queues every notification in ONE transaction, so a
 confirmation is applied and announced exactly once, however often it is replayed.
+A group chat's game card (P1) is refreshed in the background afterwards.
 """
 
 from __future__ import annotations
@@ -45,7 +46,7 @@ from app.config import Config
 from app.context import AppContext
 from app.core import billing, texts
 from app.core.models import PaymentStatus
-from app.handlers import notices
+from app.handlers import group, notices
 
 log = logging.getLogger(__name__)
 
@@ -204,6 +205,8 @@ async def _confirm(ctx: AppContext, inv_id: int, game_id: int | None, *, raw: st
         "inv_id": inv_id, "tier": outcome.payment.tier, "amount": outcome.payment.amount_rub,
         "activated": len(outcome.activated),
     })
+    if outcome.game is not None:
+        ctx.spawn(group.card_changed(ctx, outcome.game.id), name="group_card")
 
 
 def _raw(params: Mapping[str, str]) -> str:

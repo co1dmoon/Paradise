@@ -14,7 +14,7 @@ from app.core import analytics, billing, games, kb, texts
 from app.core.models import Game, GameStatus, PaymentStatus, Settings, Tier
 from app.core.payloads import normalize_code
 from app.core.pricing import PAID_TIERS, PriceList, validate_price_list
-from app.handlers import notices, views
+from app.handlers import group, notices, views
 from app.handlers.callbacks import Args, on
 from app.handlers.private import command
 from app.handlers.session import Outdated, Refusal, Session
@@ -86,6 +86,7 @@ async def _grant(s: Session, game_id: int, tier: Tier, amount: int) -> None:
         await notices.payment_applied(s.ctx, outcome)
         await notices.game_upgraded(s.ctx, upgraded, db=tx)
     await s.say(texts.granted(code=upgraded.code, tier=upgraded.tier, limit=upgraded.participant_limit))
+    await group.card_changed(s.ctx, game_id)
 
 
 @on(Action.ADMIN_CANCEL, admin_only=True)
@@ -104,6 +105,7 @@ async def _cancel_confirm(s: Session, args: Args) -> None:
     game = await games.load_game(s.db, game_id)
     await notices.game_cancelled_by_service(s.ctx, game, people)
     await s.say(texts.admin_game_cancelled(game.code))
+    await group.card_changed(s.ctx, game_id)
 
 
 @command("/refund", admin_only=True)

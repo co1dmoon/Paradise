@@ -19,7 +19,7 @@ from app.core import games, texts, users
 from app.core.billing import NoUpgradeAvailable
 from app.core.games import ExclusionProblem, GameError
 from app.core.models import GameStatus, User
-from app.core.relay import AlreadyReported, AnonChatOff, RelayLimitReached
+from app.core.relay import AlreadyReported, AnonChatOff, PairChanged, RelayLimitReached
 from app.db import Database
 from app.max_api import CallbackQuery, OutMessage, Target, UserRef
 
@@ -146,6 +146,9 @@ _REFUSALS: dict[type[GameError], str] = {
     games.DrawImpossible: texts.DRAW_IMPOSSIBLE,
     games.RedrawLimitReached: texts.REDRAW_LIMIT,
     games.TooSoon: texts.REMINDER_TOO_SOON,
+    games.RevealTooEarly: texts.REVEAL_TOO_EARLY,
+    games.AlreadyRevealed: texts.REVEAL_ALREADY_DONE,
+    PairChanged: texts.RELAY_PAIR_CHANGED,
     AnonChatOff: texts.ANON_CHAT_OFF,
     RelayLimitReached: texts.RELAY_DAILY_LIMIT,
     AlreadyReported: texts.REPORT_SENT,

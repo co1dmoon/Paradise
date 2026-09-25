@@ -19,7 +19,7 @@ from enum import StrEnum
 from app.config import Config
 from app.core import kb, texts
 from app.core.dates import format_date_button, suggest_dates
-from app.core.games import GameCounts
+from app.core.games import MAX_REDRAWS, GameCounts
 from app.core.kb import Button
 from app.core.models import (
     Game,
@@ -32,7 +32,7 @@ from app.core.models import (
     Report,
     Settings,
 )
-from app.core.payloads import deep_link, join_payload
+from app.core.payloads import deep_link, group_payload, join_payload, new_game_payload
 from app.core.pricing import PAID_TIERS, Upgrade
 from app.max_api import OutMessage
 
@@ -101,6 +101,11 @@ class Action(StrEnum):
     REF = "ref"
     BLOCK_REPORTED = "rb"
     CLOSE_REPORT = "rc"
+    GIFT_READY = "gr"
+    REDRAW = "rd"
+    REDRAW_CONFIRM = "rdy"
+    REVEAL = "rv"
+    REVEAL_CONFIRM = "rvy"
     UNBLOCK = "ub"
     ADMIN_GRANT = "ag"
     ADMIN_CANCEL = "ac"
@@ -149,6 +154,10 @@ def ref_button(game: Game, text: str = texts.BTN_NEW_GAME_ELSEWHERE) -> kb.Callb
 
 def surprise_button(game_id: int) -> kb.CallbackButton:
     return button(texts.BTN_SURPRISE_ME, Action.SURPRISE, game_id)
+
+
+def gift_ready_button(game_id: int) -> kb.CallbackButton:
+    return button(texts.BTN_GIFT_READY, Action.GIFT_READY, game_id)
 
 
 def invite_link(config: Config, game: Game) -> str:
@@ -237,12 +246,14 @@ def invite(config: Config, game: Game, participants: Sequence[str] = ()) -> OutM
 
 
 def game_created(game: Game) -> OutMessage:
-    if game.organizer_participates:
-        return OutMessage(
-            texts.GAME_CREATED,
-            kb.keyboard([button(texts.BTN_MY_WISHES, Action.WISHES, game.id), panel_button(game.id)]),
-        )
-    return OutMessage(texts.GAME_CREATED_NOT_PARTICIPATING, kb.keyboard(panel_button(game.id)))
+    if game.group_chat_id is not None:
+        text = texts.game_created_in_group(participates=game.organizer_participates)
+    elif game.organizer_participates:
+        text = texts.GAME_CREATED
+    else:
+        text = texts.GAME_CREATED_NOT_PARTICIPATING
+    buttons = [button(texts.BTN_MY_WISHES, Action.WISHES, game.id)] if game.organizer_participates else []
+    return OutMessage(text, kb.keyboard([*buttons, panel_button(game.id)]))
 
 
 # --- §5.3 joining, names and wishes -------------------------------------------------------------
@@ -293,8 +304,9 @@ def spot_opened(game: Game) -> OutMessage:
 
 
 def confirm_leave(game: Game) -> OutMessage:
+    drawn = game.status == GameStatus.DRAWN
     return OutMessage(
-        texts.confirm_leave(game.title),
+        texts.confirm_leave_after_draw(game.title) if drawn else texts.confirm_leave(game.title),
         kb.keyboard([button(texts.BTN_CONFIRM_LEAVE, Action.LEAVE_CONFIRM, game.id),
                      button(texts.BTN_CANCEL, Action.OPEN_GAME, game.id)]),
     )
@@ -343,8 +355,10 @@ def participant_view(game: Game, me: Participant, organizer: str, upgrade: Upgra
     elif game.status in (GameStatus.DRAWN, GameStatus.FINISHED) and me.status == ParticipantStatus.ACTIVE:
         rows.append(whom_button(game.id))
         if game.status == GameStatus.DRAWN:
-            rows.extend(relay_buttons(game))
-            rows.append(button(texts.BTN_EDIT_WISHES, Action.WISHES, game.id))
+            rows.append(relay_buttons(game))
+            ready = [] if me.gift_ready else [gift_ready_button(game.id)]
+            rows.append([button(texts.BTN_EDIT_WISHES, Action.WISHES, game.id), *ready,
+                         button(texts.BTN_LEAVE, Action.LEAVE, game.id)])
     if game.organizer_id == me.user_id:
         rows.append(panel_button(game.id))
     rows.append(ref_button(game))
@@ -361,8 +375,9 @@ def relay_buttons(game: Game) -> list[kb.CallbackButton]:
 # --- §5.4 organizer panel --------------------------------------------------------------------------
 
 
-def panel(game: Game, counts: GameCounts, upgrade: Upgrade | None) -> OutMessage:
-    """The organizer's panel. ``upgrade`` is the next paid tier, or None (top tier or payments off)."""
+def panel(game: Game, counts: GameCounts, upgrade: Upgrade | None, *, can_reveal: bool = False) -> OutMessage:
+    """The organizer's panel. ``upgrade`` is the next paid tier, or None (top tier or payments off);
+    ``can_reveal`` adds [Раскрыть, кто чей Санта] (§5.11)."""
     if game.status == GameStatus.COLLECTING:
         text = texts.panel(
             title=game.title, code=game.code, active=counts.active, limit=game.participant_limit,
@@ -381,7 +396,8 @@ def panel(game: Game, counts: GameCounts, upgrade: Upgrade | None) -> OutMessage
             rows.append(upgrade_button(game.id, texts.BTN_UPGRADE))
     else:
         text = texts.panel_drawn(title=game.title, code=game.code, active=counts.active,
-                                 budget=game.budget_text, exchange_date=game.exchange_date)
+                                 gifts_ready=counts.gifts_ready, budget=game.budget_text,
+                                 exchange_date=game.exchange_date)
         if game.status == GameStatus.CANCELLED:
             text = f"{text}\n{texts.GAME_CANCELLED}"
         rows = [button(texts.BTN_PARTICIPANTS, Action.PARTICIPANTS, game.id)]
@@ -390,6 +406,10 @@ def panel(game: Game, counts: GameCounts, upgrade: Upgrade | None) -> OutMessage
         if game.status == GameStatus.DRAWN:
             rows.append([button(texts.BTN_REMIND_WISHES, Action.REMIND, game.id),
                          button(texts.BTN_SETTINGS, Action.SETTINGS, game.id)])
+        if can_reveal:
+            rows.append(button(texts.BTN_REVEAL, Action.REVEAL, game.id))
+        if game.status == GameStatus.DRAWN and game.redraw_count < MAX_REDRAWS:
+            rows.append(button(texts.BTN_REDRAW, Action.REDRAW, game.id))
     if game.organizer_participates and game.status != GameStatus.CANCELLED:
         rows.append(button(texts.BTN_MY_PARTICIPATION, Action.MY_PARTICIPATION, game.id))
     return OutMessage(text, kb.keyboard(*rows))
@@ -402,7 +422,7 @@ def participants_screen(
     entries = [(p.display_name, bool(p.wishes)) for p in active]
     rows: list[Sequence[Button] | Button] = []
     removable = [p for p in (*active, *queue) if p.user_id != game.organizer_id]
-    if game.status == GameStatus.COLLECTING and removable:
+    if game.status in (GameStatus.COLLECTING, GameStatus.DRAWN) and removable:
         rows.append(button(texts.BTN_REMOVE_PARTICIPANT, Action.REMOVE_PICK, game.id, 0))
     rows.append(panel_button(game.id))
     text = texts.participants_list(entries, [p.display_name for p in queue])
@@ -427,8 +447,9 @@ def person_picker(
 
 
 def confirm_remove(game: Game, person: Participant) -> OutMessage:
+    drawn = game.status == GameStatus.DRAWN and person.status == ParticipantStatus.ACTIVE
     return OutMessage(
-        texts.confirm_remove(person.display_name),
+        texts.confirm_remove_after_draw(person.display_name) if drawn else texts.confirm_remove(person.display_name),
         kb.keyboard([button(texts.BTN_CONFIRM_REMOVE, Action.REMOVE_CONFIRM, game.id, person.user_id),
                      button(texts.BTN_CANCEL, Action.PARTICIPANTS, game.id)]),
     )
@@ -538,7 +559,66 @@ def wish_reminder(game: Game) -> OutMessage:
 def draw_result(game: Game, receiver: Participant, *, redraw: bool = False) -> OutMessage:
     text = texts.draw_result(title=game.title, receiver=receiver.display_name, wishes=receiver.wishes,
                              budget=game.budget_text, exchange_date=game.exchange_date, redraw=redraw)
-    return OutMessage(text, kb.keyboard(relay_buttons(game), ref_button(game)))
+    return OutMessage(text, kb.keyboard(relay_buttons(game), gift_ready_button(game.id), ref_button(game)))
+
+
+def confirm_redraw(game: Game) -> OutMessage:
+    return OutMessage(
+        texts.confirm_redraw(title=game.title, left=MAX_REDRAWS - game.redraw_count),
+        kb.keyboard([button(texts.BTN_CONFIRM_REDRAW, Action.REDRAW_CONFIRM, game.id),
+                     button(texts.BTN_CANCEL, Action.PANEL, game.id)]),
+    )
+
+
+def receiver_left(game: Game, receiver: Participant) -> OutMessage:
+    """P1: the giver's receiver left after the draw; the giver now gifts the leaver's receiver."""
+    return OutMessage(texts.receiver_left(receiver=receiver.display_name, wishes=receiver.wishes),
+                      kb.keyboard(relay_buttons(game)))
+
+
+def splice_needs_redraw(game: Game) -> OutMessage:
+    return OutMessage(texts.splice_needs_redraw(game.title), kb.keyboard(panel_button(game.id)))
+
+
+# --- §5.11 reveal ---------------------------------------------------------------------------------------
+
+
+def confirm_reveal(game: Game) -> OutMessage:
+    return OutMessage(
+        texts.confirm_reveal(game.title),
+        kb.keyboard([button(texts.BTN_CONFIRM_REVEAL, Action.REVEAL_CONFIRM, game.id),
+                     button(texts.BTN_CANCEL, Action.PANEL, game.id)]),
+    )
+
+
+def reveal(game: Game, chain: Sequence[tuple[str, str]]) -> OutMessage:
+    """Link mode: every participant gets the chain with the viral button."""
+    return OutMessage(texts.reveal_chain(title=game.title, pairs=chain), kb.keyboard(ref_button(game)))
+
+
+def reveal_in_group(config: Config, game: Game, chain: Sequence[tuple[str, str]]) -> OutMessage:
+    """Group mode: the chain in the chat, followed by a link to start a game elsewhere."""
+    footer = texts.reveal_group_footer(deep_link(config.max_bot_username, new_game_payload(game.code)))
+    return OutMessage(texts.reveal_chain(title=game.title, pairs=chain, footer=footer))
+
+
+# --- §5.10 group mode ------------------------------------------------------------------------------------
+
+
+def group_hello(config: Config, chat_id: int) -> OutMessage:
+    link = deep_link(config.max_bot_username, group_payload(chat_id))
+    return OutMessage(texts.GROUP_HELLO, kb.keyboard(kb.link(texts.BTN_CREATE_IN_CHAT, link)))
+
+
+def group_card(config: Config, game: Game, names: Sequence[str]) -> OutMessage:
+    """The live card in the group chat. Only a LINK button: strangers never trigger bot actions."""
+    if game.status == GameStatus.COLLECTING:
+        text = texts.group_card(title=game.title, budget=game.budget_text, exchange_date=game.exchange_date,
+                                names=names, limit=game.participant_limit)
+        return OutMessage(text, kb.keyboard(kb.link(texts.BTN_JOIN_GROUP_GAME, invite_link(config, game))))
+    if game.status == GameStatus.CANCELLED:
+        return OutMessage(texts.game_cancelled(game.title))
+    return OutMessage(texts.GROUP_CARD_DRAWN)
 
 
 def whom_do_i_gift(game: Game, receiver: Participant) -> OutMessage:

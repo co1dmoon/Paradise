@@ -32,6 +32,10 @@ class AlreadyReported(GameError):
     """The same person already complained about this message."""
 
 
+class PairChanged(GameError):
+    """A reply to a message from before a redraw or a changed pair: the counterpart is someone else now."""
+
+
 @dataclass(frozen=True, slots=True)
 class Route:
     """Who a relay goes to. ``sender``/``recipient`` carry display names for the texts."""
@@ -61,6 +65,11 @@ async def route_reply(db: Db, relay_id: int, user_id: int) -> Route:
     if relay is None or relay.to_id != user_id:
         raise PermissionDenied(f"user {user_id} cannot reply to relay {relay_id}")
     game = await _open_game(db, relay.game_id, user_id)
+    santa, receiver = (
+        (relay.from_id, relay.to_id) if relay.direction == RelayDirection.TO_RECEIVER else (relay.to_id, relay.from_id)
+    )
+    if await repo.receiver_of(db, relay.game_id, santa) != receiver:
+        raise PairChanged(relay_id)
     direction = (
         RelayDirection.TO_SANTA if relay.direction == RelayDirection.TO_RECEIVER else RelayDirection.TO_RECEIVER
     )

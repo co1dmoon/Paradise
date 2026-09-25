@@ -290,6 +290,12 @@ async def set_wishes(db: Db, game_id: int, user_id: int, wishes: str) -> None:
     )
 
 
+async def set_gift_ready(db: Db, game_id: int, user_id: int) -> None:
+    await db.execute(
+        "UPDATE participants SET gift_ready = 1 WHERE game_id = ? AND user_id = ?", (game_id, user_id)
+    )
+
+
 async def set_result_dm_ok(db: Db, game_id: int, user_id: int, ok: bool | None) -> int:
     result = await db.execute(
         "UPDATE participants SET result_dm_ok = ? WHERE game_id = ? AND user_id = ?", (ok, game_id, user_id)
@@ -570,6 +576,14 @@ async def prune_processed_updates(db: Db, before: datetime) -> int:
     result = await db.execute("DELETE FROM processed_updates WHERE ts < ?", (to_iso(before),))
     return result.rowcount
 
+
+
+async def detach_group_chat(db: Db, chat_id: int) -> int:
+    """The bot left a group chat (§5.10): its games continue in link mode."""
+    result = await db.execute(
+        "UPDATE games SET group_chat_id = NULL, group_card_mid = NULL WHERE group_chat_id = ?", (chat_id,)
+    )
+    return result.rowcount
 
 
 # --- scheduler (§10) ---------------------------------------------------------------

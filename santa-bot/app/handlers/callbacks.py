@@ -25,7 +25,7 @@ from app.core.games import ACTIVE, WAITING
 from app.core.models import Game, GameStatus, Participant, ParticipantStatus, RelayDirection, StateKind
 from app.core.payloads import DIRECT_SOURCE, parse_start_payload
 from app.core.pricing import PAID_TIERS, upgrade_options
-from app.handlers import flows, notices, views
+from app.handlers import flows, group, notices, views
 from app.handlers.flows import WizardStep
 from app.handlers.session import Outdated, Refusal, Session, open_session
 from app.handlers.views import Action, button
@@ -128,6 +128,9 @@ def _require_collecting(game: Game, after_draw: str) -> None:
 
 async def _people(s: Session, game_id: int, *statuses: ParticipantStatus) -> list[Participant]:
     return await repo.participants(s.db, game_id, *statuses)
+
+
+_OPEN = (GameStatus.COLLECTING, GameStatus.DRAWN)
 
 
 # --- §5.1 consent and menu -----------------------------------------------------------------------------
@@ -287,22 +290,24 @@ async def _change_name(s: Session, args: Args) -> None:
 async def _leave(s: Session, args: Args) -> None:
     game = await games.load_game(s.db, args.number(0))
     await flows.require_me(s, game.id)
-    _require_collecting(game, texts.LEAVE_AFTER_DRAW)
+    games.require_status(game, *_OPEN)
     await s.show(views.confirm_leave(game))
 
 
 @on(Action.LEAVE_CONFIRM)
 async def _leave_confirm(s: Session, args: Args) -> None:
+    """Leaving before the draw frees a place; after it, the cycle is spliced (P1, §5.5)."""
     game_id = args.number(0)
     async with s.ctx.locks.game(game_id):
         game = await games.load_game(s.db, game_id)
         await flows.require_me(s, game_id)
-        _require_collecting(game, texts.LEAVE_AFTER_DRAW)
+        games.require_status(game, *_OPEN)
         if game.organizer_id == s.user_id:
-            activated = await games.set_organizer_participation(s.db, game_id, s.user_id, False, s.now())
+            departure = await games.set_organizer_participation(s.db, game_id, s.user_id, False, s.now())
         else:
-            activated = (await games.leave_game(s.db, game_id, s.user_id, s.now())).activated
-    await notices.participants_activated(s.ctx, game, activated)
+            departure = await games.leave_game(s.db, game_id, s.user_id, s.now())
+    await notices.departed(s.ctx, game, departure)
+    await group.card_changed(s.ctx, game_id)
     await s.show(OutMessage(texts.left_game(game.title), views.menu_keyboard()))
 
 
@@ -322,8 +327,7 @@ async def _participants_screen(s: Session, game: Game, notice: str | None = None
 
 @on(Action.REMOVE_PICK)
 async def _remove_pick(s: Session, args: Args) -> None:
-    game = await _organized(s, args.number(0))
-    _require_collecting(game, texts.ALREADY_DRAWN_ACTION)
+    game = await _organized(s, args.number(0), *_OPEN)
     people = [p for p in await _people(s, game.id, ACTIVE, WAITING) if p.user_id != game.organizer_id]
     if not people:
         raise Refusal(texts.NOBODY_TO_REMOVE)
@@ -337,8 +341,7 @@ async def _remove_pick(s: Session, args: Args) -> None:
 
 @on(Action.REMOVE)
 async def _remove(s: Session, args: Args) -> None:
-    game = await _organized(s, args.number(0))
-    _require_collecting(game, texts.ALREADY_DRAWN_ACTION)
+    game = await _organized(s, args.number(0), *_OPEN)
     await s.show(views.confirm_remove(game, await _removable(s, game, args.number(1))))
 
 
@@ -346,12 +349,12 @@ async def _remove(s: Session, args: Args) -> None:
 async def _remove_confirm(s: Session, args: Args) -> None:
     game_id, user_id = args.number(0), args.number(1)
     async with s.ctx.locks.game(game_id):
-        game = await _organized(s, game_id)
-        _require_collecting(game, texts.ALREADY_DRAWN_ACTION)
+        game = await _organized(s, game_id, *_OPEN)
         person = await _removable(s, game, user_id)
         departure = await games.remove_participant(s.db, game_id, s.user_id, user_id, s.now())
     await notices.participant_removed(s.ctx, game, person)
-    await notices.participants_activated(s.ctx, game, departure.activated)
+    await notices.departed(s.ctx, game, departure)
+    await group.card_changed(s.ctx, game_id)
     await s.show(await _participants_screen(s, game, texts.participant_removed(person.display_name)))
 
 
@@ -465,6 +468,60 @@ async def _draw_confirm(s: Session, args: Args) -> None:
         return
     await notices.draw_results(s.ctx, result)
     await s.say(OutMessage(texts.DRAW_STARTED, kb.keyboard(views.panel_button(game_id))))
+    await group.card_changed(s.ctx, game_id)
+
+
+@on(Action.REDRAW)
+async def _redraw(s: Session, args: Args) -> None:
+    game = await _organized(s, args.number(0), GameStatus.DRAWN)
+    if game.redraw_count >= games.MAX_REDRAWS:
+        raise Refusal(texts.REDRAW_LIMIT)
+    await s.show(views.confirm_redraw(game))
+
+
+@on(Action.REDRAW_CONFIRM)
+async def _redraw_confirm(s: Session, args: Args) -> None:
+    """P1 (§5.5): new pairs for everyone, at most twice; the old ones stop counting."""
+    game_id = args.number(0)
+    await s.acknowledge()
+    try:
+        async with s.ctx.locks.game(game_id):
+            result = await games.run_draw(s.db, game_id, s.user_id, now=s.now(), rng=s.ctx.rng, redraw=True)
+    except games.DrawImpossible:
+        await s.say(OutMessage(texts.REDRAW_IMPOSSIBLE, kb.keyboard(views.panel_button(game_id))))
+        return
+    await notices.draw_results(s.ctx, result, redraw=True)
+    await s.say(OutMessage(texts.REDRAW_STARTED, kb.keyboard(views.panel_button(game_id))))
+
+
+@on(Action.GIFT_READY)
+async def _gift_ready(s: Session, args: Args) -> None:
+    await games.mark_gift_ready(s.db, args.number(0), s.user_id)
+    await s.say(texts.GIFT_READY_SAVED)
+
+
+@on(Action.REVEAL)
+async def _reveal(s: Session, args: Args) -> None:
+    game = await _organized(s, args.number(0), GameStatus.DRAWN, GameStatus.FINISHED)
+    if game.reveal_done:
+        raise Refusal(texts.REVEAL_ALREADY_DONE)
+    if not games.can_reveal(game, s.today()):
+        raise Refusal(texts.REVEAL_TOO_EARLY)
+    await s.show(views.confirm_reveal(game))
+
+
+@on(Action.REVEAL_CONFIRM)
+async def _reveal_confirm(s: Session, args: Args) -> None:
+    """§5.11 (P1): the chain goes out once, to the group chat or to every participant."""
+    game_id = args.number(0)
+    async with s.ctx.locks.game(game_id):
+        revealed = await games.reveal(s.db, game_id, s.user_id, today=s.today(), now=s.now())
+    if revealed.game.group_chat_id is not None:
+        await group.post_reveal(s.ctx, revealed)
+        await s.say(OutMessage(texts.REVEAL_SENT_TO_GROUP, kb.keyboard(views.panel_button(game_id))))
+    else:
+        await notices.reveal(s.ctx, revealed)
+        await s.say(OutMessage(texts.REVEAL_SENT, kb.keyboard(views.panel_button(game_id))))
 
 
 @on(Action.NOT_RECEIVED)
@@ -561,8 +618,9 @@ async def _toggle_participation(s: Session, args: Args) -> None:
         game = await _organized(s, game_id)
         _require_collecting(game, texts.PARTICIPATION_ONLY_BEFORE_DRAW)
         participates = not game.organizer_participates
-        activated = await games.set_organizer_participation(s.db, game_id, s.user_id, participates, s.now())
-    await notices.participants_activated(s.ctx, game, activated)
+        departure = await games.set_organizer_participation(s.db, game_id, s.user_id, participates, s.now())
+    await notices.departed(s.ctx, game, departure)
+    await group.card_changed(s.ctx, game_id)
     await s.show(views.settings_screen(await games.load_game(s.db, game_id)))
     me = await repo.get_participant(s.db, game_id, s.user_id)
     if participates and me is not None and not me.wishes:
@@ -582,6 +640,7 @@ async def _cancel_game_confirm(s: Session, args: Args) -> None:
     game = await games.load_game(s.db, game_id)
     await notices.game_cancelled(s.ctx, game, people)
     await s.show(OutMessage(texts.game_cancelled_by_you(game.title), views.menu_keyboard()))
+    await group.card_changed(s.ctx, game_id)
 
 
 # --- §5.6 upgrades and payment -------------------------------------------------------------------------------
@@ -618,6 +677,7 @@ async def _pay(s: Session, args: Args) -> None:
         result = await billing.request_upgrade(s.db, game.id, s.user_id, tier, prices, s.now())
     if isinstance(result, billing.PaymentOutcome):
         await notices.payment_applied(s.ctx, result)
+        await group.card_changed(s.ctx, game.id)
         return
     limit = prices.limit_for(result.tier)
     url = build_payment_url(config, inv_id=result.inv_id, amount_rub=result.amount_rub,

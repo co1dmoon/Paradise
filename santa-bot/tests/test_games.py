@@ -284,8 +284,8 @@ async def test_settings_and_cancel(db: Database, new_game, make_user, clock) -> 
 async def test_organizer_participation_toggle(db: Database, new_game, make_user, clock) -> None:
     game = await new_game()
     await join_many(db, clock, make_user, game.id, range(1, 11))  # 10 active (with organizer) + 1 waiting
-    activated = await games.set_organizer_participation(db, game.id, ORGANIZER, False, clock.now())
-    assert [p.user_id for p in activated] == [10]
+    departure = await games.set_organizer_participation(db, game.id, ORGANIZER, False, clock.now())
+    assert departure is not None and [p.user_id for p in departure.activated] == [10]
     await games.set_organizer_participation(db, game.id, ORGANIZER, True, clock.now())
     organizer = await repo.get_participant(db, game.id, ORGANIZER)
     assert organizer is not None and organizer.status == ParticipantStatus.WAITING

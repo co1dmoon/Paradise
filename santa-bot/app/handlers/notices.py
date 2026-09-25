@@ -14,7 +14,7 @@ from app import repo
 from app.context import AppContext
 from app.core import texts
 from app.core.billing import PaymentOutcome
-from app.core.games import DrawResult
+from app.core.games import Departure, DrawResult, Reveal
 from app.core.models import Game, Participant, StateKind
 from app.core.pricing import Upgrade
 from app.core.users import display_name_from_profile
@@ -41,6 +41,23 @@ async def participants_activated(ctx: AppContext, game: Game, activated: Sequenc
             await repo.set_state_if_idle(ctx.db, participant.user_id, StateKind.WISHES, ctx.clock.now(),
                                          game_id=game.id)
         await _to(ctx, participant.user_id, views.spot_opened(game), game_id=game.id)
+
+
+async def departed(ctx: AppContext, game: Game, departure: Departure | None) -> None:
+    """Someone left or was removed: people from the queue take the place (before the draw), or
+    the leaver's Santa gets a new receiver (after it, P1); the organizer is asked to redraw
+    when the new pair is excluded or fewer than 3 people remain."""
+    if departure is None:
+        return
+    await participants_activated(ctx, game, departure.activated)
+    splice = departure.splice
+    if splice is None:
+        return
+    receiver = await repo.get_participant(ctx.db, game.id, splice.receiver_id)
+    if receiver is not None:
+        await _to(ctx, splice.giver_id, views.receiver_left(game, receiver), game_id=game.id)
+    if splice.needs_redraw:
+        await _to(ctx, game.organizer_id, views.splice_needs_redraw(game), game_id=game.id)
 
 
 async def participant_removed(ctx: AppContext, game: Game, person: Participant) -> None:
@@ -74,10 +91,13 @@ async def draw_results(ctx: AppContext, result: DrawResult, *, redraw: bool = Fa
     """Queue every participant's pair in one transaction (§5.5).
 
     The purpose lets the delivery hook record result_dm_ok and send the organizer the
-    'Пары отправлены' summary once everything is sent or dead.
+    'Пары отправлены' summary once everything is sent or dead. A redraw drops the old
+    pairs still waiting in the queue, so they can never arrive after the new ones.
     """
     game = result.game
     async with ctx.db.transaction() as tx:
+        if redraw:
+            await ctx.outbox.cancel_pending(PURPOSE_DRAW_RESULT, game.id, db=tx)
         for giver_id in result.pairs:
             await ctx.outbox.enqueue(
                 Target.user(giver_id), views.draw_result(game, result.receiver_for(giver_id), redraw=redraw),
@@ -115,6 +135,14 @@ async def payer_name(ctx: AppContext, game: Game, user_id: int) -> str:
         return participant.display_name
     user = await repo.get_user(ctx.db, user_id)
     return display_name_from_profile(user.max_name if user else None)
+
+
+async def reveal(ctx: AppContext, revealed: Reveal) -> None:
+    """§5.11 in link mode: every participant gets the chain with [Устроить игру в другом чате]."""
+    game = revealed.game
+    message = views.reveal(game, revealed.chain)
+    for person in revealed.people:
+        await _to(ctx, person.user_id, message, dedupe_key=f"reveal:{game.id}:{person.user_id}", game_id=game.id)
 
 
 # --- §5.9 the scheduler's notices --------------------------------------------------------------------

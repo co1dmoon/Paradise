@@ -167,6 +167,12 @@ GAME_CREATED_NOT_PARTICIPATING = (
     "или скопируйте ссылку. Когда кто-то вступит — я напишу."
 )
 
+
+def game_created_in_group(*, participates: bool) -> str:
+    """§5.10: the game card is already in the group chat, nothing to forward."""
+    text = "Готово! Карточка игры уже в чате: участники нажимают «Участвую». Когда кто-то вступит — я напишу."
+    return text + (" Напишите свои пожелания." if participates else "")
+
 # --- §5.3 joining ------------------------------------------------------------------------------
 
 ASK_CODE = "Отправьте код игры — 6 символов из приглашения."
@@ -223,7 +229,14 @@ def confirm_leave(title: str) -> str:
 
 
 BTN_CONFIRM_LEAVE = "Да, выйти"
-LEAVE_AFTER_DRAW = "После жеребьёвки выйти из игры нельзя — напишите организатору."
+
+
+def confirm_leave_after_draw(title: str) -> str:
+    return (
+        f"Выйти из игры {_q(title)}? Жеребьёвка уже прошла: я перестрою пары, "
+        "и ваш Тайный Санта будет дарить другому участнику."
+    )
+
 
 
 def left_game(title: str) -> str:
@@ -244,10 +257,11 @@ def panel(*, title: str, code: str, active: int, limit: int, waiting: int, witho
     )
 
 
-def panel_drawn(*, title: str, code: str, active: int, budget: str, exchange_date: date | None) -> str:
+def panel_drawn(*, title: str, code: str, active: int, gifts_ready: int, budget: str,
+                exchange_date: date | None) -> str:
     return (
         f"Игра {_q(title)} · код {code}\n"
-        f"Жеребьёвка проведена, участников: {active}.\n"
+        f"Жеребьёвка проведена, участников: {active}. Подарки готовы: {gifts_ready} из {active}.\n"
         f"Бюджет: {budget} · Обмен: {date_text(exchange_date)}"
     )
 
@@ -280,6 +294,10 @@ PICK_PARTICIPANT_TO_REMOVE = "Кого убрать из игры?"
 
 def confirm_remove(name: str) -> str:
     return f"Убрать {_q(name)} из игры?"
+
+
+def confirm_remove_after_draw(name: str) -> str:
+    return f"Убрать {_q(name)} из игры? Жеребьёвка уже прошла: его или её Санте я назначу другого получателя."
 
 
 BTN_CONFIRM_REMOVE = "Да, убрать"
@@ -404,6 +422,19 @@ DRAW_IMPOSSIBLE = "Не получается учесть все исключе�
 DRAW_STARTED = "Жеребьёвка проведена! Рассылаю пары участникам — сообщу, когда всё дойдёт."
 REDRAW_PREFIX = "Жеребьёвка проведена заново — старую пару не учитывайте."
 REDRAW_LIMIT = "Перезапускать жеребьёвку можно не больше 2 раз."
+
+
+def confirm_redraw(*, title: str, left: int) -> str:
+    times = "раз" if left == 1 else "раза"
+    return (
+        f"Перезапустить жеребьёвку в игре {_q(title)}? Все получат новые пары, старые перестанут действовать. "
+        f"Перезапустить можно ещё {left} {times}."
+    )
+
+
+BTN_CONFIRM_REDRAW = "Да, перезапустить"
+REDRAW_STARTED = "Жеребьёвка проведена заново! Рассылаю новые пары — сообщу, когда всё дойдёт."
+REDRAW_IMPOSSIBLE = "Не получается составить новые пары с учётом исключений."
 
 
 def draw_result(*, title: str, receiver: str, wishes: str | None, budget: str,
@@ -590,6 +621,7 @@ ANON_CHAT_OFF = "Организатор выключил анонимные со
 RELAY_NOT_AVAILABLE = "Сообщения доступны только после жеребьёвки."
 REPORT_SENT = "Спасибо, жалоба отправлена. Мы проверим."
 RELAY_EMPTY = "Напишите текст сообщения."
+RELAY_PAIR_CHANGED = "Пары изменились — ответить на это сообщение уже нельзя. Нажмите «Кому я дарю?» в своей игре."
 
 
 def report_to_admin(*, report_id: int, code: str | None, reporter_id: int, reported_id: int, text: str) -> str:
@@ -693,6 +725,8 @@ GROUP_CARD_DRAWN = (
 
 REVEAL_TOO_EARLY = "Раскрыть пары можно после даты обмена."
 REVEAL_ALREADY_DONE = "Пары уже раскрыты."
+REVEAL_SENT = "Готово! Все участники узнали, кто чей Санта."
+REVEAL_SENT_TO_GROUP = "Готово! Цепочку «кто чей Санта» я отправил в чат."
 
 
 def confirm_reveal(title: str) -> str:
@@ -702,9 +736,9 @@ def confirm_reveal(title: str) -> str:
 BTN_CONFIRM_REVEAL = "Да, раскрыть"
 
 
-def reveal_chain(*, title: str, pairs: Iterable[tuple[str, str]]) -> str:
+def reveal_chain(*, title: str, pairs: Iterable[tuple[str, str]], footer: str = "") -> str:
     return fit_lines([f"{giver} → {receiver}" for giver, receiver in pairs],
-                     header=f"Кто чей Санта в игре {_q(title)}:")
+                     header=f"Кто чей Санта в игре {_q(title)}:", footer=footer)
 
 
 def reveal_group_footer(link: str) -> str:
@@ -864,6 +898,13 @@ def error_alert(summary: str) -> str:
 def with_suppressed(text: str, suppressed: int) -> str:
     """An admin alert followed by how many similar alerts were held back."""
     return text + (f"\n(похожих сообщений пропущено: {suppressed})" if suppressed else "")
+
+
+def backup_upload_failed(reason: str) -> str:
+    return (
+        f"Не удалось отправить резервную копию в хранилище S3 ({reason}). Копия на сервере сохранена. "
+        "Проверьте S3_ENDPOINT, S3_BUCKET, S3_KEY, S3_SECRET и S3_REGION."
+    )
 
 
 TOKEN_REJECTED = "Токен бота не принят — проверьте MAX_BOT_TOKEN"

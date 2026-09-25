@@ -120,8 +120,8 @@ async def collect_stats(db: Db, start: datetime, end: datetime) -> StatsBlock:
     draw_sizes = [
         int(row[0])
         for row in await db.fetchall(
-            "SELECT json_extract(props, '$.n') FROM events"
-            " WHERE type = 'draw_done' AND ts >= ? AND ts < ?",
+            "SELECT json_extract(props, '$.n') FROM events WHERE type = 'draw_done' AND ts >= ? AND ts < ?"
+            " AND NOT COALESCE(json_extract(props, '$.redraw'), 0)",
             span,
         )
         if row[0] is not None

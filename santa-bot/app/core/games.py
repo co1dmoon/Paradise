@@ -86,6 +86,14 @@ class TooSoon(GameError):
     """A throttled action (the wish reminder) was used less than 24 h ago."""
 
 
+class RevealTooEarly(GameError):
+    """The pairs can be revealed from the exchange date on."""
+
+
+class AlreadyRevealed(GameError):
+    pass
+
+
 class ExclusionProblem(StrEnum):
     SAME_PERSON = "same_person"
     NOT_PARTICIPANT = "not_participant"
@@ -153,6 +161,7 @@ class GameCounts:
     waiting: int
     without_wishes: int
     exclusions: int
+    gifts_ready: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +172,15 @@ class DrawResult:
 
     def receiver_for(self, giver_id: int) -> Participant:
         return self.participants[self.pairs[giver_id]]
+
+
+@dataclass(frozen=True, slots=True)
+class Reveal:
+    """Who was whose Santa (§5.11): ``chain`` holds (giver, receiver) names in cycle order."""
+
+    game: Game
+    chain: list[tuple[str, str]]
+    people: list[Participant]
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,10 +378,12 @@ async def remove_participant(
 
 async def set_organizer_participation(
     db: Db, game_id: int, organizer_id: int, participates: bool, now: datetime
-) -> list[Participant]:
-    """'участвую/не участвую' in the settings (collecting only). Returns people activated from the queue."""
+) -> Departure | None:
+    """'участвую/не участвую' in the settings (collecting), or the organizer leaving the exchange
+    after the draw. Returns the departure when the organizer stopped taking part."""
+    allowed = (GameStatus.COLLECTING,) if participates else (GameStatus.COLLECTING, GameStatus.DRAWN)
     async with db.transaction() as tx:
-        game = await _load_organized(tx, game_id, organizer_id, GameStatus.COLLECTING)
+        game = await _load_organized(tx, game_id, organizer_id, *allowed)
         await repo.update_game(tx, game_id, organizer_participates=participates)
         existing = await repo.get_participant(tx, game_id, organizer_id)
         if participates:
@@ -375,11 +395,10 @@ async def set_organizer_participation(
                 await repo.upsert_participant(
                     tx, game_id, organizer_id, name, ACTIVE if has_room else WAITING, JoinVia.ORGANIZER, now
                 )
-            return []
+            return None
         if existing is None or existing.status not in (ACTIVE, WAITING):
-            return []
-        departure = await _depart(tx, game, existing, ParticipantStatus.LEFT, now)
-        return departure.activated
+            return None
+        return await _depart(tx, game, existing, ParticipantStatus.LEFT, now)
 
 
 async def _depart(
@@ -390,9 +409,10 @@ async def _depart(
         await repo.delete_exclusions_of(db, game.id, participant.user_id)
         activated = await activate_waiting(db, game.id) if participant.status == ACTIVE else []
         return Departure(participant, activated, None)
-    if game.status == GameStatus.DRAWN and participant.status == ACTIVE:
+    if game.status == GameStatus.DRAWN:
         await repo.set_participant_status(db, game.id, participant.user_id, status)
-        return Departure(participant, [], await _splice(db, game.id, participant.user_id))
+        splice = await _splice(db, game.id, participant.user_id) if participant.status == ACTIVE else None
+        return Departure(participant, [], splice)
     raise WrongStatus(game.status)
 
 
@@ -451,13 +471,15 @@ async def game_counts(db: Db, game_id: int) -> GameCounts:
         "SELECT"
         " COALESCE(SUM(status = 'active'), 0),"
         " COALESCE(SUM(status = 'waiting'), 0),"
-        " COALESCE(SUM(status = 'active' AND COALESCE(wishes, '') = ''), 0)"
+        " COALESCE(SUM(status = 'active' AND COALESCE(wishes, '') = ''), 0),"
+        " COALESCE(SUM(status = 'active' AND gift_ready = 1), 0)"
         " FROM participants WHERE game_id = ?",
         (game_id,),
     )
     assert row is not None
     return GameCounts(
-        active=row[0], waiting=row[1], without_wishes=row[2], exclusions=len(await repo.exclusions(db, game_id))
+        active=row[0], waiting=row[1], without_wishes=row[2], exclusions=len(await repo.exclusions(db, game_id)),
+        gifts_ready=row[3],
     )
 
 
@@ -606,6 +628,58 @@ async def my_receiver(db: Db, game_id: int, user_id: int) -> Participant | None:
     await require_participant(db, game_id, user_id)
     receiver_id = await repo.receiver_of(db, game_id, user_id)
     return None if receiver_id is None else await repo.get_participant(db, game_id, receiver_id)
+
+
+async def mark_gift_ready(db: Db, game_id: int, user_id: int) -> None:
+    """[Подарок готов]: the organizer's panel counts ready gifts."""
+    async with db.transaction() as tx:
+        require_status(await load_game(tx, game_id), GameStatus.DRAWN)
+        await require_participant(tx, game_id, user_id)
+        await repo.set_gift_ready(tx, game_id, user_id)
+
+
+# --- reveal (§5.11) ----------------------------------------------------------------------------------
+
+
+def can_reveal(game: Game, today: date) -> bool:
+    """Once per game, after the draw, from the exchange date on (any time when there is no date)."""
+    return (
+        game.status in (GameStatus.DRAWN, GameStatus.FINISHED)
+        and not game.reveal_done
+        and (game.exchange_date is None or today >= game.exchange_date)
+    )
+
+
+async def reveal(db: Db, game_id: int, organizer_id: int, *, today: date, now: datetime) -> Reveal:
+    """Mark the game revealed and return the chain to announce."""
+    async with db.transaction() as tx:
+        game = await _load_organized(tx, game_id, organizer_id, GameStatus.DRAWN, GameStatus.FINISHED)
+        if game.reveal_done:
+            raise AlreadyRevealed(game_id)
+        if not can_reveal(game, today):
+            raise RevealTooEarly(game.exchange_date)
+        pairs = await repo.assignments(tx, game_id)
+        everyone = await repo.participants(tx, game_id)
+        await repo.update_game(tx, game_id, reveal_done=True)
+        await record(tx, Event.REVEAL, now, user_id=organizer_id, game_id=game_id, n=len(pairs))
+        return Reveal(game, _chain(pairs, everyone), [p for p in everyone if p.status == ACTIVE])
+
+
+def _chain(pairs: dict[int, int], people: list[Participant]) -> list[tuple[str, str]]:
+    """'Ольга → Иван, Иван → Мария, …': follow the cycle from the first participant who joined.
+
+    Every participant is tried as a start, so nobody is lost if the pairs form several cycles.
+    """
+    names = {p.user_id: p.display_name for p in people}
+    chain: list[tuple[str, str]] = []
+    visited: set[int] = set()
+    for start in (p.user_id for p in people):
+        giver = start
+        while giver in pairs and giver not in visited:
+            visited.add(giver)
+            chain.append((names.get(giver, "?"), names.get(pairs[giver], "?")))
+            giver = pairs[giver]
+    return chain
 
 
 async def record_result_delivery(

@@ -20,6 +20,7 @@ from app.core.dates import local_today
 from app.core.models import Settings
 from app.core.pricing import PriceList
 from app.db import Database
+from app.debounce import Debouncer
 from app.locks import Locks
 from app.max_api import MaxApi
 from app.outbox import Outbox
@@ -49,7 +50,11 @@ class AppContext:
     rng: random.Random
     locks: Locks = field(default_factory=Locks)
     runtime: RuntimeState = field(default_factory=RuntimeState)
+    debouncer: Debouncer = field(init=False)
     _tasks: set[asyncio.Task[Any]] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        self.debouncer = Debouncer(self.clock, self.spawn)
 
     async def settings(self) -> Settings:
         return await repo.get_settings(self.db)

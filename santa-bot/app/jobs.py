@@ -20,7 +20,7 @@ from app.core.games import ACTIVE, WAITING
 from app.core.models import GameStatus
 from app.handlers import flows, notices
 from app.max_api import MaxApiError, Unauthorized, ensure_subscription
-from app.tls import CERTS_DIR, bundled_certificates
+from app.tls import CERTS_DIR, build_ssl_context, bundled_certificates
 
 log = logging.getLogger(__name__)
 
@@ -126,11 +126,22 @@ async def purge_old_data(ctx: AppContext) -> None:
 
 
 async def backup_database(ctx: AppContext) -> None:
-    """04:00 MSK: online backup to /data/backups/santa-YYYYMMDD.db, keeping 14 files."""
-    directory = ctx.config.backups_dir
-    path = await backup.make_backup(ctx.db, directory, ctx.today())
-    removed = backup.rotate(directory)
+    """04:00 MSK: online backup to /data/backups/santa-YYYYMMDD.db, keeping 14 files;
+    also to the S3 bucket when S3_* is set (P1)."""
+    config = ctx.config
+    path = await backup.make_backup(ctx.db, config.backups_dir, ctx.today())
+    removed = backup.rotate(config.backups_dir)
     log.info("backup written", extra={"file": path.name, "removed": len(removed)})
+    if not config.s3_enabled:
+        return
+    bucket = backup.Bucket(config.s3_endpoint, config.s3_bucket, config.s3_key, config.s3_secret, config.s3_region)
+    try:
+        await backup.upload(bucket, path, ctx.clock.now(), build_ssl_context())
+    except backup.UploadFailed as error:
+        log.error("backup upload failed", extra={"error": str(error)})
+        await ctx.alerts.notify_admins(texts.backup_upload_failed(str(error)))
+        return
+    log.info("backup uploaded", extra={"file": path.name})
 
 
 # --- the bot's own health -----------------------------------------------------------------------------

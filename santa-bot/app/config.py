@@ -97,6 +97,7 @@ class Config:
     s3_bucket: str
     s3_key: str
     s3_secret: str
+    s3_region: str
     warnings: tuple[str, ...] = field(default=())
 
     @property
@@ -330,6 +331,8 @@ def _build(reader: _Reader, data_dir: Path, generated: Mapping[str, str]) -> Con
     if any(s3.values()) and not all(s3.values()):
         missing = ", ".join(name for name, value in s3.items() if not value)
         problems.append(f"Для резервных копий в S3 заполните все переменные S3_*: не хватает {missing}.")
+    if s3["S3_ENDPOINT"] and not s3["S3_ENDPOINT"].startswith("https://"):
+        problems.append(f"S3_ENDPOINT должен начинаться с https:// (сейчас: {s3['S3_ENDPOINT']!r}).")
 
     port = reader.integer("PORT", 8080)
     return Config(
@@ -365,6 +368,7 @@ def _build(reader: _Reader, data_dir: Path, generated: Mapping[str, str]) -> Con
         s3_bucket=s3["S3_BUCKET"],
         s3_key=s3["S3_KEY"],
         s3_secret=s3["S3_SECRET"],
+        s3_region=reader.text("S3_REGION", "ru-central1"),
         warnings=tuple(reader.warnings),
     )
 

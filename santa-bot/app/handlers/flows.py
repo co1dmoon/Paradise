@@ -22,6 +22,7 @@ from app.core.games import ACTIVE, WAITING, GameDraft, JoinOutcome
 from app.core.inputs import MAX_BUDGET, MAX_NAME, MAX_RELAY, MAX_TITLE, MAX_WISHES, clean_text
 from app.core.models import Game, GameStatus, JoinVia, Participant, PaymentStatus, RelayDirection, StateKind, UserState
 from app.core.payloads import (
+    GroupPayload,
     JoinPayload,
     NewGamePayload,
     OrganizerPayload,
@@ -30,9 +31,9 @@ from app.core.payloads import (
 )
 from app.core.pricing import Upgrade, next_upgrade
 from app.core.users import display_name_from_profile
-from app.handlers import views
+from app.handlers import group, views
 from app.handlers.session import Outdated, Refusal, Session
-from app.max_api import Target
+from app.max_api import MaxApiError, Target
 
 # --- menu and payloads ---------------------------------------------------------------------------
 
@@ -56,6 +57,8 @@ async def route_payload(s: Session, payload: StartPayload | None) -> None:
                 await open_game(s, game.id)
         case PaymentReturnPayload(inv_id):
             await payment_return(s, inv_id)
+        case GroupPayload(chat_id):
+            await start_group_game(s, chat_id)
         case _:
             await show_menu(s)
 
@@ -88,6 +91,7 @@ class WizardDraft:
     budget: str = ""
     exchange_date: date | None = None
     source_game_id: int | None = None
+    group_chat_id: int | None = None
 
     def to_data(self) -> dict[str, Any]:
         return {
@@ -96,6 +100,7 @@ class WizardDraft:
             "budget": self.budget,
             "date": self.exchange_date.isoformat() if self.exchange_date else None,
             "source_game_id": self.source_game_id,
+            "group_chat_id": self.group_chat_id,
         }
 
     @classmethod
@@ -110,6 +115,7 @@ class WizardDraft:
             budget=data["budget"],
             exchange_date=date.fromisoformat(data["date"]) if data["date"] else None,
             source_game_id=data["source_game_id"],
+            group_chat_id=data.get("group_chat_id"),
         )
 
 
@@ -120,12 +126,22 @@ async def load_wizard(s: Session, *steps: WizardStep) -> WizardDraft:
     return draft
 
 
-async def start_wizard(s: Session, source_game_id: int | None = None) -> None:
+async def start_wizard(s: Session, source_game_id: int | None = None, group_chat_id: int | None = None) -> None:
     if await _maintenance(s):
         return
     games.check_can_create(s.user, s.today())
-    await _save_wizard(s, WizardDraft(WizardStep.TITLE, source_game_id=source_game_id))
+    await _save_wizard(s, WizardDraft(WizardStep.TITLE, source_game_id=source_game_id, group_chat_id=group_chat_id))
     await s.say(views.ask_title())
+
+
+async def start_group_game(s: Session, chat_id: int) -> None:
+    """[Создать игру в этом чате] (§5.10): the wizard for a game with a card in that chat."""
+    try:
+        await s.ctx.api.get_chat(chat_id)
+    except MaxApiError:
+        await s.say(texts.GROUP_NOT_FOUND)
+        return
+    await start_wizard(s, group_chat_id=chat_id)
 
 
 async def start_referred(s: Session, code: str) -> None:
@@ -193,11 +209,15 @@ async def wizard_finish(s: Session, participates: bool) -> None:
         source = None
     game = await games.create_game(
         s.db, s.user_id,
-        GameDraft(draft.title, draft.budget, draft.exchange_date, participates, source_game_id=source),
+        GameDraft(draft.title, draft.budget, draft.exchange_date, participates, source_game_id=source,
+                  group_chat_id=draft.group_chat_id),
         await s.ctx.settings(), now=s.now(), today=s.today(), rng=s.ctx.rng,
     )
     await repo.clear_state(s.db, s.user_id)
-    await s.say(views.invite(s.ctx.config, game))
+    if game.group_chat_id is None:
+        await s.say(views.invite(s.ctx.config, game))
+    else:
+        await group.card_changed(s.ctx, game.id)
     await s.say(views.game_created(game))
     if participates:
         await repo.set_state(s.db, s.user_id, StateKind.WISHES, s.now(), game_id=game.id)
@@ -250,6 +270,7 @@ async def save_setting(s: Session, game_id: int, **fields: Any) -> None:
     game = await games.update_game_settings(s.db, game_id, s.user_id, **fields)
     await repo.clear_state(s.db, s.user_id)
     await s.show(views.settings_screen(game, notice=texts.SETTINGS_SAVED))
+    await group.card_changed(s.ctx, game_id)
 
 
 # --- §5.3 joining -----------------------------------------------------------------------------------
@@ -276,6 +297,7 @@ async def join(s: Session, code: str, via: JoinVia) -> None:
             assert result.participant is not None
             await s.say(views.joined(game, await organizer_name(s.ctx, game), result.participant.display_name))
             await ask_for_wishes(s, game.id)
+            await group.card_changed(s.ctx, game.id)
         case JoinOutcome.WAITING:
             await s.say(views.waiting(game, await s.ctx.settings(), await offer_upgrade(s.ctx, game)))
         case JoinOutcome.ALREADY_IN:
@@ -388,7 +410,8 @@ async def show_panel(s: Session, game_id: int) -> None:
     game = await games.load_game(s.db, game_id)
     games.require_organizer(game, s.user_id)
     counts = await games.game_counts(s.db, game_id)
-    await s.show(views.panel(game, counts, await offer_upgrade(s.ctx, game)))
+    await s.show(views.panel(game, counts, await offer_upgrade(s.ctx, game),
+                             can_reveal=games.can_reveal(game, s.today())))
 
 
 async def payment_return(s: Session, inv_id: int) -> None:
