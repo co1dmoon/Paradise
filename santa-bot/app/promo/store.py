@@ -17,7 +17,7 @@ from typing import Any
 from app.config import PromoConfig
 from app.core.clock import from_iso, to_iso
 from app.db import Db
-from app.promo.platforms import Budget, BudgetKind, CampaignInfo, CampaignState, Platform, SpendRow
+from app.promo.platforms import Budget, BudgetKind, CampaignInfo, CampaignState, Platform, SpendLimit, SpendRow
 from app.promo.rules import ActionKind, PausedBy
 from app.promo.vkads import StoredToken
 
@@ -41,6 +41,7 @@ class ActionStatus(StrEnum):
 class PostStatus(StrEnum):
     SENT = "sent"
     SKIPPED = "skipped"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,11 +52,15 @@ class PromoCampaign:
     name: str
     state: CampaignState
     budget: Budget | None
-    plan_budget: Budget | None
+    previous_budget_kop: int | None  # the budget(s) replaced on last_budget_change_day
+    limit: SpendLimit | None
+    pays_per_conversion: bool
     registered_at: datetime
     enabled: bool
     last_budget_change_day: date | None
     paused_by: PausedBy | None
+    changed_at: datetime | None  # the bot's last change of state or budget
+    spend_checked_at: datetime | None  # the last successful fetch of the spend
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,16 +172,12 @@ async def enabled_campaigns(db: Db) -> list[PromoCampaign]:
 async def register_campaign(db: Db, platform: Platform, info: CampaignInfo, now: datetime) -> PromoCampaign:
     """Start managing a campaign; registering it again re-enables it and keeps its history."""
     src = campaign_src(platform, info.id)
-    budget = info.budget
     await db.execute(
-        "INSERT INTO promo_campaigns (src, platform, external_id, name, state, budget_kind, budget_kop,"
-        " plan_budget_kop, plan_budget_kind, registered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        " ON CONFLICT (src) DO UPDATE SET name = excluded.name, state = excluded.state,"
-        " budget_kind = excluded.budget_kind, budget_kop = excluded.budget_kop, enabled = 1",
-        (src, platform, info.id, info.name, info.state, budget.kind if budget else None,
-         budget.kop if budget else None, budget.kop if budget else None, budget.kind if budget else None,
-         to_iso(now)),
+        "INSERT INTO promo_campaigns (src, platform, external_id, name, registered_at) VALUES (?, ?, ?, ?, ?)"
+        " ON CONFLICT (src) DO UPDATE SET name = excluded.name, enabled = 1",
+        (src, platform, info.id, info.name, to_iso(now)),
     )
+    await _write_info(db, src, info)
     campaign = await get_campaign(db, src)
     assert campaign is not None
     return campaign
@@ -186,32 +187,72 @@ async def disable_campaign(db: Db, src: str) -> None:
     await db.execute("UPDATE promo_campaigns SET enabled = 0 WHERE src = ?", (src,))
 
 
-async def save_campaign_info(db: Db, src: str, info: CampaignInfo) -> None:
-    """What the platform reports now (the name stays as registered). A campaign resumed in the cabinet
-    is no longer paused by the autopilot; an admin's pause stays on record until /ads resume, so
-    rules 3–4 leave that campaign alone."""
-    budget = info.budget
+async def save_campaign_info(db: Db, src: str, info: CampaignInfo, *, today: date, fetched_at: datetime) -> None:
+    """What the platform reported at ``fetched_at`` (the name stays as registered). Nothing is written
+    when the bot changed the campaign after that moment: the fetched values are older.
+
+    A budget changed in the cabinet counts as changed today (on that day the old one may still
+    spend). A campaign resumed in the cabinet is no longer paused by the autopilot; an admin's
+    pause stays on record until /ads resume, so rules 5–6 leave that campaign alone.
+    """
+    current = await get_campaign(db, src)
+    if current is None or (current.changed_at is not None and current.changed_at >= fetched_at):
+        return
+    if current.budget is not None and info.budget is not None and info.budget != current.budget:
+        await _record_budget_change(db, current, today)
+    await _write_info(db, src, info)
+
+
+async def _write_info(db: Db, src: str, info: CampaignInfo) -> None:
+    budget, limit = info.budget, info.limit
     await db.execute(
-        "UPDATE promo_campaigns SET state = ?, budget_kind = ?, budget_kop = ?,"
+        "UPDATE promo_campaigns SET state = ?, budget_kind = ?, budget_kop = ?, limit_kop = ?, limit_start = ?,"
+        " limit_end = ?, pays_per_conversion = ?,"
         " paused_by = CASE WHEN ? = 'paused' OR paused_by = 'admin' THEN paused_by END WHERE src = ?",
-        (info.state, budget.kind if budget else None, budget.kop if budget else None, info.state, src),
+        (info.state, budget.kind if budget else None, budget.kop if budget else None, limit.kop if limit else None,
+         _iso_date(limit.start if limit else None), _iso_date(limit.end if limit else None),
+         int(info.pays_per_conversion), info.state, src),
     )
 
 
-async def mark_missing(db: Db, src: str) -> None:
+async def mark_missing(db: Db, src: str, *, fetched_at: datetime) -> None:
     """The platform no longer lists the campaign (deleted in the cabinet)."""
-    await db.execute("UPDATE promo_campaigns SET state = 'other' WHERE src = ?", (src,))
-
-
-async def set_state(db: Db, src: str, state: CampaignState, paused_by: PausedBy | None) -> None:
-    await db.execute("UPDATE promo_campaigns SET state = ?, paused_by = ? WHERE src = ?", (state, paused_by, src))
-
-
-async def set_budget(db: Db, src: str, budget: Budget, day: date) -> None:
     await db.execute(
-        "UPDATE promo_campaigns SET budget_kop = ?, budget_kind = ?, last_budget_change_day = ? WHERE src = ?",
-        (budget.kop, budget.kind, day.isoformat(), src),
+        "UPDATE promo_campaigns SET state = 'other' WHERE src = ? AND (changed_at IS NULL OR changed_at < ?)",
+        (src, to_iso(fetched_at)),
     )
+
+
+async def set_state(db: Db, src: str, state: CampaignState, paused_by: PausedBy | None, now: datetime) -> None:
+    await db.execute("UPDATE promo_campaigns SET state = ?, paused_by = ?, changed_at = ? WHERE src = ?",
+                     (state, paused_by, to_iso(now), src))
+
+
+async def set_budget(db: Db, src: str, budget: Budget, *, today: date, now: datetime) -> None:
+    """The bot changed the budget; the one it replaced may still spend today."""
+    current = await get_campaign(db, src)
+    if current is not None:
+        await _record_budget_change(db, current, today)
+    await db.execute("UPDATE promo_campaigns SET budget_kop = ?, budget_kind = ?, changed_at = ? WHERE src = ?",
+                     (budget.kop, budget.kind, to_iso(now), src))
+
+
+async def _record_budget_change(db: Db, campaign: PromoCampaign, today: date) -> None:
+    """Remember the budget being replaced (added to any replaced earlier the same day)."""
+    earlier = (campaign.previous_budget_kop or 0) if campaign.last_budget_change_day == today else 0
+    replaced = earlier + (campaign.budget.kop if campaign.budget else 0)
+    await db.execute(
+        "UPDATE promo_campaigns SET previous_budget_kop = ?, last_budget_change_day = ? WHERE src = ?",
+        (replaced, today.isoformat(), campaign.src),
+    )
+
+
+async def spend_within(db: Db, src: str, start: date | None, end: date | None) -> int:
+    """The stored spend of a campaign between two days (inclusive); without dates, all of it."""
+    return int(await db.fetchval(
+        "SELECT COALESCE(SUM(cost_kop), 0) FROM promo_spend WHERE src = ? AND day BETWEEN ? AND ?",
+        (src, (start or date.min).isoformat(), (end or date.max).isoformat()),
+    ))
 
 
 def _campaign(row: Any) -> PromoCampaign:
@@ -222,11 +263,16 @@ def _campaign(row: Any) -> PromoCampaign:
         name=row["name"],
         state=CampaignState(row["state"]),
         budget=_budget(row["budget_kop"], row["budget_kind"]),
-        plan_budget=_budget(row["plan_budget_kop"], row["plan_budget_kind"]),
+        previous_budget_kop=row["previous_budget_kop"],
+        limit=None if row["limit_kop"] is None else SpendLimit(
+            row["limit_kop"], _date(row["limit_start"]), _date(row["limit_end"])),
+        pays_per_conversion=bool(row["pays_per_conversion"]),
         registered_at=from_iso(row["registered_at"]),
         enabled=bool(row["enabled"]),
         last_budget_change_day=_date(row["last_budget_change_day"]),
         paused_by=PausedBy(row["paused_by"]) if row["paused_by"] else None,
+        changed_at=from_iso(row["changed_at"]) if row["changed_at"] else None,
+        spend_checked_at=from_iso(row["spend_checked_at"]) if row["spend_checked_at"] else None,
     )
 
 
@@ -238,15 +284,19 @@ def _date(value: str | None) -> date | None:
     return None if value is None else date.fromisoformat(value)
 
 
+def _iso_date(value: date | None) -> str | None:
+    return None if value is None else value.isoformat()
+
+
 # --- spend -----------------------------------------------------------------------------------------------
 
 
 async def replace_spend(
     db: Db, srcs: Sequence[str], date_from: date, date_to: date, rows: Mapping[tuple[str, date], SpendRow],
-    now: datetime,
+    fetched_at: datetime,
 ) -> None:
-    """Store a fetched range: platforms revise recent days and omit days without spend,
-    so the range replaces what was stored for these campaigns."""
+    """Store a fetched range for these campaigns (only those whose spend was fetched): platforms
+    revise recent days and omit days without spend, so the range replaces what was stored."""
     marks = ", ".join("?" for _ in srcs)
     async with db.transaction() as tx:
         await tx.execute(
@@ -255,8 +305,11 @@ async def replace_spend(
         )
         await tx.executemany(
             "INSERT INTO promo_spend (src, day, cost_kop, clicks, fetched_at) VALUES (?, ?, ?, ?, ?)",
-            [(src, day.isoformat(), row.cost_kop, row.clicks, to_iso(now)) for (src, day), row in rows.items()],
+            [(src, day.isoformat(), row.cost_kop, row.clicks, to_iso(fetched_at))
+             for (src, day), row in rows.items() if src in srcs],
         )
+        await tx.execute(f"UPDATE promo_campaigns SET spend_checked_at = ? WHERE src IN ({marks})",
+                         (to_iso(fetched_at), *srcs))
 
 
 async def spend_totals(db: Db, today: date, cutoff: date) -> dict[str, SpendTotals]:
@@ -338,6 +391,15 @@ async def expire_proposals(db: Db, before: datetime) -> int:
     return result.rowcount
 
 
+async def expire_open_proposals(db: Db, reason: str) -> int:
+    """Close the autopilot's open proposals (it was switched off)."""
+    result = await db.execute(
+        "UPDATE promo_actions SET status = 'expired', error = ? WHERE status = 'proposed' AND mode = 'auto'",
+        (reason,),
+    )
+    return result.rowcount
+
+
 def _action(row: Any) -> PromoAction:
     return PromoAction(
         id=row["id"], ts=from_iso(row["ts"]), src=row["src"], action=ActionKind(row["action"]),
@@ -379,13 +441,26 @@ async def mark_post(db: Db, post_id: str, status: PostStatus, now: datetime) -> 
     return result.rowcount == 1
 
 
-async def resend_skipped_post(db: Db, post_id: str, now: datetime) -> bool:
-    """An admin sends a post that was skipped as overdue."""
+async def resend_post(db: Db, post_id: str, now: datetime) -> bool:
+    """An admin sends again a post that was skipped as overdue or refused by MAX."""
     result = await db.execute(
-        "UPDATE promo_posts_sent SET status = 'sent', sent_at = ? WHERE post_id = ? AND status = 'skipped'",
+        "UPDATE promo_posts_sent SET status = 'sent', sent_at = ? WHERE post_id = ?"
+        " AND status IN ('skipped', 'failed')",
         (to_iso(now), post_id),
     )
     return result.rowcount == 1
+
+
+async def set_post_outbox(db: Db, post_id: str, outbox_id: int) -> None:
+    await db.execute("UPDATE promo_posts_sent SET outbox_id = ? WHERE post_id = ?", (outbox_id, post_id))
+
+
+async def mark_post_failed(db: Db, outbox_id: int) -> str | None:
+    """MAX refused the post sent as outbox row ``outbox_id``; returns its id."""
+    post_id = await db.fetchval("SELECT post_id FROM promo_posts_sent WHERE outbox_id = ?", (outbox_id,))
+    if post_id is not None:
+        await db.execute("UPDATE promo_posts_sent SET status = 'failed' WHERE post_id = ?", (post_id,))
+    return None if post_id is None else str(post_id)
 
 
 async def post_statuses(db: Db) -> dict[str, PostStatus]:

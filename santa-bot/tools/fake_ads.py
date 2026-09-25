@@ -7,6 +7,7 @@ records every call in order and can fail on demand:
     direct.add("701", "Поиск", budget=Budget(300_000, BudgetKind.WEEK))
     direct.spend_on("701", date(2026, 11, 28), 12_000)
     direct.fail("suspend", Transient("down"))
+    direct.refuse_spend_for("702")  # like VK: one unknown campaign fails the whole statistics request
     ctx.ad_platforms[Platform.DIRECT] = direct
 
 The HTTP clients themselves are tested against aiohttp test servers (tests/test_promo_direct.py
@@ -20,39 +21,48 @@ from dataclasses import replace
 from datetime import date
 
 from app.promo.platforms import (
-    AdApiError,
     Budget,
     BudgetKind,
     CampaignInfo,
     CampaignState,
     Platform,
+    PlatformError,
     SpendByDay,
+    SpendLimit,
     SpendRow,
+    gross_kop,
+    net_kop,
 )
 
 READS = frozenset({"list_campaigns", "daily_spend"})
 
 
 class FakeAdPlatform:
-    def __init__(self, platform: Platform) -> None:
+    def __init__(self, platform: Platform, *, vat_pct: int = 22) -> None:
         self.platform = platform
+        self.vat_pct = vat_pct
         self.campaigns: dict[str, CampaignInfo] = {}
         self.spend: SpendByDay = {}
         self.calls: list[tuple[object, ...]] = []
-        self._failures: dict[str, list[AdApiError]] = {}
+        self._failures: dict[str, list[Exception]] = {}
+        self._refused_spend: set[str] = set()
 
     # --- setup --------------------------------------------------------------------------------------
 
     def add(self, campaign_id: str, name: str, *, state: CampaignState = CampaignState.ACTIVE,
-            budget: Budget | None = None) -> None:
-        self.campaigns[campaign_id] = CampaignInfo(campaign_id, name, state, budget)
+            budget: Budget | None = None, limit: SpendLimit | None = None, pays_per_conversion: bool = False) -> None:
+        self.campaigns[campaign_id] = CampaignInfo(campaign_id, name, state, budget, limit, pays_per_conversion)
 
     def spend_on(self, campaign_id: str, day: date, cost_kop: int, clicks: int = 10) -> None:
         self.spend[(campaign_id, day)] = SpendRow(cost_kop, clicks)
 
-    def fail(self, method: str, error: AdApiError, times: int = 1) -> None:
-        """The next ``times`` calls of ``method`` raise ``error``."""
+    def fail(self, method: str, error: Exception, times: int = 1) -> None:
+        """The next ``times`` calls of ``method`` raise ``error`` (usually an ``AdApiError``)."""
         self._failures.setdefault(method, []).extend([error] * times)
+
+    def refuse_spend_for(self, campaign_id: str) -> None:
+        """Every spend request that includes this campaign fails (VK: 400 ERR_WRONG_ADPLANS)."""
+        self._refused_spend.add(campaign_id)
 
     def mutations(self) -> list[tuple[object, ...]]:
         """The calls that change something on the platform (suspend, resume, set_budget)."""
@@ -66,6 +76,8 @@ class FakeAdPlatform:
 
     async def daily_spend(self, ids: Sequence[str], date_from: date, date_to: date) -> SpendByDay:
         self._call("daily_spend", tuple(ids), date_from, date_to)
+        if self._refused_spend.intersection(ids):
+            raise PlatformError("ERR_WRONG_ADPLANS", "Запрашиваемые рекламные планы не существуют или недоступны")
         return {key: row for key, row in self.spend.items() if key[0] in ids and date_from <= key[1] <= date_to}
 
     async def suspend(self, campaign_id: str) -> None:
@@ -76,9 +88,10 @@ class FakeAdPlatform:
         self._call("resume", campaign_id)
         self._set(campaign_id, state=CampaignState.ACTIVE)
 
-    async def set_budget(self, campaign_id: str, gross_kop: int, kind: BudgetKind) -> None:
-        self._call("set_budget", campaign_id, gross_kop, kind)
-        self._set(campaign_id, budget=Budget(gross_kop, kind))
+    async def set_budget(self, campaign_id: str, gross: int, kind: BudgetKind) -> None:
+        self._call("set_budget", campaign_id, gross, kind)
+        # a platform keeps budgets net of VAT, so it reports them back to the kopeck of the net amount
+        self._set(campaign_id, budget=Budget(gross_kop(net_kop(gross, self.vat_pct), self.vat_pct), kind))
 
     async def close(self) -> None:
         """Nothing to release."""

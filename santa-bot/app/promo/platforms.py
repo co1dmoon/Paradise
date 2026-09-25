@@ -32,6 +32,7 @@ DEFAULT_TIMEOUT = 30.0
 UNSUPPORTED_BUDGET = "unsupported_budget"  # not a budget the client can change (Direct weekly, VK daily)
 NOT_FOUND = "not_found"
 BAD_RESPONSE = "bad_response"  # an answer that cannot be read
+NOT_APPLIED = "not_applied"  # the platform took a change but still reports the old value
 
 
 class Platform(StrEnum):
@@ -57,11 +58,23 @@ class Budget:
 
 
 @dataclass(frozen=True, slots=True)
+class SpendLimit:
+    """A limit on a campaign's total spend, gross: VK's budget for the whole campaign (no dates) or
+    Direct's budget for a period (``start``..``end``)."""
+
+    kop: int
+    start: date | None = None
+    end: date | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class CampaignInfo:
     id: str
     name: str
     state: CampaignState
-    budget: Budget | None  # None: the platform shows no weekly (Direct) or daily (VK) budget
+    budget: Budget | None  # the budget the autopilot may change: Direct's weekly, VK's daily
+    limit: SpendLimit | None = None
+    pays_per_conversion: bool = False  # Direct: charged per conversion, which may all come on one day
 
 
 @dataclass(frozen=True, slots=True)

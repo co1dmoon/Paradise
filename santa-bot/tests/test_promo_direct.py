@@ -11,14 +11,18 @@ import pytest
 from app.core.clock import FakeClock
 from app.promo.direct import SANDBOX_URL, DirectClient
 from app.promo.platforms import (
+    NOT_APPLIED,
     UNSUPPORTED_BUDGET,
     AuthError,
     Budget,
     BudgetKind,
     CampaignInfo,
     CampaignState,
+    HttpClient,
+    HttpReply,
     PlatformError,
     RateLimited,
+    SpendLimit,
     SpendRow,
     Transient,
 )
@@ -69,26 +73,45 @@ async def test_campaigns_get_request_and_budget_parsing(server: ScriptedServer, 
             "WeeklySpendLimit": 300_000_000, "CustomPeriodBudget": {"SpendLimit": 5_000_000_000}}}}),
         unified(706, "Клик за период", "ON", {"Search": {"BiddingStrategyType": "AVERAGE_CPC", "AverageCpc": {
             "AverageCpc": 5_000_000, "WeeklySpendLimit": 1_000_000_000, "BudgetType": "CUSTOM_PERIOD_BUDGET"}}}),
+        unified(707, "Сезон", "ON", {"Search": {"BiddingStrategyType": "WB_MAXIMUM_CLICKS", "WbMaximumClicks": {
+            "WeeklySpendLimit": None, "CustomPeriodBudget": {"SpendLimit": 5_000_000_000, "StartDate": "2026-11-24",
+                                                             "EndDate": "2026-12-12", "AutoContinue": "NO"}}},
+            "Network": {"BiddingStrategyType": "NETWORK_DEFAULT"}}),
+        unified(708, "За конверсии", "ON", {"Search": {"BiddingStrategyType": "PAY_FOR_CONVERSION",
+                                                       "PayForConversion": {"Cpa": 50_000_000, "GoalId": 1,
+                                                                            "WeeklySpendLimit": 2_000_000_000}}}),
+        unified(709, "Две части", "ON", {"Search": SEARCH_ONLY["Search"],
+                                         "Network": {"BiddingStrategyType": "AVERAGE_CPC", "AverageCpc": {
+                                             "AverageCpc": 5_000_000, "WeeklySpendLimit": 1_000_000_000}}}),
+        unified(710, "Ручная", "ON", {"Search": {"BiddingStrategyType": "HIGHEST_POSITION"}}),
     ]}}, headers={"Units": "11/20828/64000"}))
 
-    campaigns = await direct.list_campaigns(["701", "702", "703", "704", "705", "706"])
+    ids = ["701", "702", "703", "704", "705", "706", "707", "708", "709", "710"]
+    campaigns = await direct.list_campaigns(ids)
 
     (seen,) = server.requests
     assert seen.path == "/json/v501/campaigns"
     assert seen.headers["Authorization"] == f"Bearer {TOKEN}" and seen.headers["Accept-Language"] == "ru"
     assert seen.json == {"method": "get", "params": {
-        "SelectionCriteria": {"Ids": [701, 702, 703, 704, 705, 706]},
+        "SelectionCriteria": {"Ids": [int(campaign_id) for campaign_id in ids]},
         "FieldNames": ["Id", "Name", "Type", "State", "Status"],
         "UnifiedCampaignFieldNames": ["BiddingStrategy"],
     }}
+    week = BudgetKind.WEEK
     assert campaigns == [
-        CampaignInfo("701", "Поиск", CampaignState.ACTIVE, Budget(366_00, BudgetKind.WEEK)),  # 300 ₽ net + 22%
-        CampaignInfo("702", "Сети", CampaignState.PAUSED, Budget(1220_00, BudgetKind.WEEK)),
+        CampaignInfo("701", "Поиск", CampaignState.ACTIVE, Budget(366_00, week)),  # 300 ₽ net + 22%
+        CampaignInfo("702", "Сети", CampaignState.PAUSED, Budget(1220_00, week)),
+        # budgets that cannot be read (a period without dates, a period flagged without its numbers,
+        # budgets in both parts, a manual strategy) leave the budget unknown
         CampaignInfo("703", "Период", CampaignState.OTHER, None),
         CampaignInfo("704", "Старая", CampaignState.OTHER, None),
-        # a budget for a period limits these, not the weekly figure: the budget counts as unknown
         CampaignInfo("705", "Период и неделя", CampaignState.ACTIVE, None),
         CampaignInfo("706", "Клик за период", CampaignState.ACTIVE, None),
+        CampaignInfo("707", "Сезон", CampaignState.ACTIVE, None,
+                     limit=SpendLimit(6100_00, date(2026, 11, 24), date(2026, 12, 12))),
+        CampaignInfo("708", "За конверсии", CampaignState.ACTIVE, Budget(2440_00, week), pays_per_conversion=True),
+        CampaignInfo("709", "Две части", CampaignState.ACTIVE, None),
+        CampaignInfo("710", "Ручная", CampaignState.ACTIVE, None),
     ]
     assert await direct.list_campaigns([]) == [] and len(server.requests) == 1
 
@@ -103,21 +126,32 @@ async def test_suspend_and_resume_are_idempotent(server: ScriptedServer, direct:
                  Reply(body={"result": {results: [{"Id": 701, "Warnings": [
                      {"Code": warning, "Message": "Объект уже в этом состоянии"}]}]}}),
                  Reply(body={"result": {results: [{"Errors": [
-                     {"Code": 8800, "Message": "Объект не найден", "Details": "Кампания не найдена"}]}]}}))
+                     {"Code": 8800, "Message": "Объект не найден", "Details": "Кампания не найдена"}]}]}}),
+                 Reply(body={"result": {results: [{"Id": 701, "Warnings": [
+                     {"Code": 10165, "Message": "Параметр не будет применен"}]}]}}))
     call = getattr(direct, method)
     await call("701")
     await call("701")
     with pytest.raises(PlatformError) as error:
         await call("999")
     assert (error.value.code, error.value.message) == (8800, "Объект не найден Кампания не найдена")
+    with pytest.raises(PlatformError) as error:
+        await call("701")
+    assert error.value.code == 10165, "any other warning may mean nothing happened"
     assert server.requests[0].json == {"method": method, "params": {"SelectionCriteria": {"Ids": [701]}}}
 
 
-async def test_weekly_budget_update_sends_the_strategy_type_and_net_micros(server: ScriptedServer,
-                                                                          direct: DirectClient) -> None:
-    server.reply(CAMPAIGNS,
-                 Reply(body={"result": {"Campaigns": [unified(701, "Поиск", "ON", SEARCH_ONLY)]}}),
-                 Reply(body={"result": {"UpdateResults": [{"Id": 701}]}}))
+def with_weekly(micros: int) -> Reply:
+    return Reply(body={"result": {"Campaigns": [unified(701, "Поиск", "ON", {
+        "Search": {"BiddingStrategyType": "WB_MAXIMUM_CLICKS", "WbMaximumClicks": {"WeeklySpendLimit": micros}},
+        "Network": {"BiddingStrategyType": "SERVING_OFF"}})]}})
+
+
+async def test_weekly_budget_update_sends_the_strategy_type_and_net_micros_and_reads_it_back(
+    server: ScriptedServer, direct: DirectClient
+) -> None:
+    server.reply(CAMPAIGNS, with_weekly(300_000_000), Reply(body={"result": {"UpdateResults": [{"Id": 701}]}}),
+                 with_weekly(385_240_000))
 
     await direct.set_budget("701", 470_00, BudgetKind.WEEK)  # 470 ₽ gross = 385.24 ₽ net
 
@@ -126,18 +160,37 @@ async def test_weekly_budget_update_sends_the_strategy_type_and_net_micros(serve
         "UnifiedCampaign": {"BiddingStrategy": {"Search": {
             "BiddingStrategyType": "WB_MAXIMUM_CLICKS", "WbMaximumClicks": {"WeeklySpendLimit": 385_240_000}}}},
     }]}}
+    assert server.requests[2].json["method"] == "get", "the budget is read back"
+
+
+@pytest.mark.parametrize(("update", "read_back", "code"), [
+    # «Настройка не будет изменена»: a warning, and the budget stays as it was
+    (Reply(body={"result": {"UpdateResults": [{"Id": 701, "Warnings": [
+        {"Code": 10163, "Message": "Настройка не будет изменена"}]}]}}), None, 10163),
+    (Reply(body={"result": {"UpdateResults": [{"Id": 701}]}}), with_weekly(300_000_000), NOT_APPLIED),
+])
+async def test_a_budget_change_that_did_not_happen_fails(server: ScriptedServer, direct: DirectClient,
+                                                         update: Reply, read_back: Reply | None, code: object) -> None:
+    server.reply(CAMPAIGNS, with_weekly(300_000_000), update, *([read_back] if read_back else []))
+    with pytest.raises(PlatformError) as error:
+        await direct.set_budget("701", 470_00, BudgetKind.WEEK)
+    assert error.value.code == code
 
 
 async def test_budget_changes_that_cannot_work_fail_clearly(server: ScriptedServer, direct: DirectClient) -> None:
     with pytest.raises(PlatformError):
         await direct.set_budget("701", 470_00, BudgetKind.DAY)
     assert server.requests == [], "nothing is sent for a daily budget"
-    server.reply(CAMPAIGNS, Reply(body={"result": {"Campaigns": [unified(703, "Период", "ON", {
-        "Search": {"BiddingStrategyType": "AVERAGE_CRR", "AverageCrr": {"Crr": 20, "WeeklySpendLimit": 10**9}}})]}}))
-    with pytest.raises(PlatformError) as error:
-        await direct.set_budget("703", 470_00, BudgetKind.WEEK)
-    assert error.value.code == UNSUPPORTED_BUDGET
-    assert server.routes() == [CAMPAIGNS], "no update is attempted"
+    manual = unified(703, "Ручная", "ON", {"Search": {"BiddingStrategyType": "HIGHEST_POSITION"}})
+    period = unified(704, "Сезон", "ON", {"Search": {"BiddingStrategyType": "WB_MAXIMUM_CLICKS", "WbMaximumClicks": {
+        "CustomPeriodBudget": {"SpendLimit": 10**9, "StartDate": "2026-11-24", "EndDate": "2026-12-12"}}}})
+    server.reply(CAMPAIGNS, Reply(body={"result": {"Campaigns": [manual]}}),
+                 Reply(body={"result": {"Campaigns": [period]}}))
+    for campaign_id in ("703", "704"):
+        with pytest.raises(PlatformError) as error:
+            await direct.set_budget(campaign_id, 470_00, BudgetKind.WEEK)
+        assert error.value.code == UNSUPPORTED_BUDGET
+    assert server.routes() == [CAMPAIGNS, CAMPAIGNS], "no update is attempted"
 
 
 async def test_spend_report_waits_for_the_offline_queue(server: ScriptedServer, direct: DirectClient,
@@ -182,6 +235,29 @@ async def test_report_wait_is_bounded(server: ScriptedServer, direct: DirectClie
     with pytest.raises(Transient):
         await direct.daily_spend(["701"], date(2026, 11, 30), date(2026, 11, 30))
     assert len(server.requests) == 3, "two waits of 120 s fit into 5 minutes, a third does not"
+
+
+class SlowHttp(HttpClient):
+    """Every request takes ``seconds`` of the fake clock and answers 202 «retry in 10 s»."""
+
+    def __init__(self, clock: FakeClock, seconds: float) -> None:
+        super().__init__()
+        self.clock, self.seconds = clock, seconds
+        self.timeouts: list[float | None] = []
+
+    async def request(self, method: str, url: str, **kwargs: object) -> HttpReply:
+        timeout = kwargs.get("timeout")
+        self.timeouts.append(timeout if isinstance(timeout, float | int) else None)
+        self.clock.advance(self.seconds)
+        return HttpReply(202, {"retryIn": "10"}, "")
+
+
+async def test_slow_answers_count_against_the_report_wait(clock: FakeClock) -> None:
+    http = SlowHttp(clock, seconds=100)
+    direct = DirectClient(TOKEN, vat_pct=22, clock=clock, http=http)
+    with pytest.raises(Transient):
+        await direct.daily_spend(["701"], date(2026, 11, 30), date(2026, 11, 30))
+    assert http.timeouts == [120, 120, 80], "the last request may only take what is left of the 5 minutes"
 
 
 @pytest.mark.parametrize(("reply", "error", "code"), [

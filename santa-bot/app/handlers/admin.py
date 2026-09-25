@@ -10,7 +10,8 @@ remove what someone wrote in a game; /game's [Сбросить название]
 
 The ad autopilot (PROMO_SPEC §7), with PROMO_ENABLED=1: /ads and its subcommands,
 /link and /links (manual tracking links), /channel (posts in the owner's MAX channel),
-and the report's [Поднять до X ₽] [Не надо] buttons. These handlers only parse; the
+the [Поднять до X ₽] / [Да, X ₽ …] and [Не надо] buttons of raises and large budget
+changes, and /ads remove's [Остановить на площадке]. These handlers only parse; the
 work and the re-checks live in ``app.promo``.
 """
 
@@ -23,6 +24,7 @@ from collections.abc import Awaitable, Callable
 from app import repo
 from app.config import MAX_LAG_DAYS, MAX_RAISE_PCT
 from app.core import analytics, billing, games, kb, texts
+from app.core.dates import format_moment
 from app.core.inputs import MAX_TITLE, clean_text, shorten
 from app.core.models import Game, GameStatus, PaymentStatus, Settings, Tier
 from app.core.payloads import normalize_code
@@ -336,8 +338,9 @@ async def _ads_add(s: Session, args: str) -> None:
     except AdApiError as error:
         raise Refusal(texts.promo_unreachable(platform=platform, detail=autopilot.describe(error))) from None
     config = s.ctx.config
+    blind = checked and campaign.budget is None and campaign.limit is None
     await s.say(texts.promo_registered(
-        platform=platform, name=campaign.name, src=campaign.src, validated=checked,
+        platform=platform, name=campaign.name, src=campaign.src, validated=checked, blind=blind,
         landing_url=links.landing_url(config, campaign.src), template=links.campaign_template(config, platform),
     ))
 
@@ -422,13 +425,24 @@ async def _promo_approve(s: Session, args: Args) -> None:
     _require_promo(s)
     action_id = args.number(0)
     await s.acknowledge()  # the platform may take longer to answer than a button may wait
-    await s.show(await autopilot.approve(s.ctx, action_id, s.user_id))
+    try:
+        result = await autopilot.approve(s.ctx, action_id, s.user_id)
+    except autopilot.TryAgain as error:
+        raise Refusal(error.text) from None  # a new message: the buttons stay for another try
+    await s.show(result)
 
 
 @on(Action.PROMO_DECLINE, admin_only=True)
 async def _promo_decline(s: Session, args: Args) -> None:
     _require_promo(s)
     await s.show(await autopilot.decline(s.ctx, args.number(0), s.user_id))
+
+
+@on(Action.PROMO_STOP_REMOVED, admin_only=True)
+async def _promo_stop_removed(s: Session, args: Args) -> None:
+    _require_promo(s)
+    await s.acknowledge()
+    await s.show(await autopilot.stop_removed(s.ctx, args.text(0), s.user_id))
 
 
 @command("/link", admin_only=True)
@@ -473,14 +487,15 @@ async def _channel_status(s: Session, args: str) -> None:
     ctx, tz = s.ctx, s.ctx.config.tz
     statuses = list((await promo_store.post_statuses(s.db)).values())
     upcoming = [
-        texts.channel_upcoming_line(post_id=post.id, when=channel.when_text(at, tz),
+        texts.channel_upcoming_line(post_id=post.id, when=format_moment(at, tz),
                                     first_line=post.text.split("\n", 1)[0])
         for post, at in await channel.upcoming(ctx, 3)
     ]
     await s.say(texts.channel_status(
         on=(await promo_store.get_settings(s.db)).channel_on, channel_id=ctx.config.promo.channel_id,
         sent=statuses.count(promo_store.PostStatus.SENT), skipped=statuses.count(promo_store.PostStatus.SKIPPED),
-        total=len(content.CALENDAR), upcoming=upcoming, known=await promo_store.known_channels(s.db),
+        failed=statuses.count(promo_store.PostStatus.FAILED), total=len(content.CALENDAR), upcoming=upcoming,
+        known=await promo_store.known_channels(s.db), unmarked=not ctx.config.promo.channel_ad_label,
     ))
 
 
@@ -489,7 +504,7 @@ async def _channel_test(s: Session, args: str) -> None:
     if not upcoming:
         raise Refusal(texts.CHANNEL_NOTHING_LEFT)
     post, at = upcoming[0]
-    await s.say(texts.channel_preview(post_id=post.id, when=channel.when_text(at, s.ctx.config.tz)))
+    await s.say(texts.channel_preview(post_id=post.id, when=format_moment(at, s.ctx.config.tz)))
     await s.say(channel.post_message(s.ctx.config, post))
 
 
@@ -498,7 +513,7 @@ async def _channel_on(s: Session, args: str) -> None:
     if channel_id is None:
         raise Refusal(texts.CHANNEL_NO_ID)
     await promo_store.set_settings(s.db, channel_on=True)
-    await s.say(texts.channel_on(channel_id=channel_id))
+    await s.say(texts.channel_on(channel_id=channel_id, unmarked=not s.ctx.config.promo.channel_ad_label))
 
 
 async def _channel_off(s: Session, args: str) -> None:

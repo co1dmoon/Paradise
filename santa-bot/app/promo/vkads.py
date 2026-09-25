@@ -7,19 +7,25 @@
   with HTTP 403; ``POST v2/oauth2/token/delete.json`` with the client id and secret deletes
   the account's tokens. So the pair is kept in the database and reused, refreshed ahead of
   expiry, and a new one is requested only without a usable pair; on the limit the tokens
-  are deleted once and the request is repeated once.
+  are deleted once and the request is repeated once. A refused refresh falls back to a new
+  token.
 - A request with a bad token gets 401 ``{"code", "message"}``: ``expired_token`` (refresh
   and repeat), ``invalid_token`` (issue a new one and repeat), ``invalid_client`` (wrong id
   or secret), ``invalid_user`` / ``revoked_token`` (the account itself).
 - ``GET v2/ad_plans.json?_id__in=…&fields=…`` lists campaigns ({count, offset, items}; at
-  most 50 per page); status is active, blocked or deleted; ``budget_limit_day`` and
-  ``budget_limit`` are decimals net of VAT.
+  most 50 per page); status is active, blocked or deleted; ``budget_limit_day`` (the daily
+  budget, which the autopilot changes) and ``budget_limit`` (the budget for the whole
+  campaign, read as a limit on its total spend) are decimals net of VAT.
 - ``POST v2/ad_plans/mass_action.json`` takes a JSON array of changes (up to 200) and
   answers 204: ``{"id", "status": "blocked"|"active"}`` or ``{"id", "budget_limit_day"}``.
 - ``GET v2/statistics/ad_plans/day.json?id=…&date_from=…&date_to=…&metrics=base`` answers
-  ``items[{id, rows[{date, base{clicks, spent}}]}]``; ``spent`` is net of VAT.
-- Limits come in ``X-RateLimit-{RPS,Hourly,Daily}-Remaining`` headers; 429 means "too many".
-  An exhausted hour or day stops calls until it is over; an exhausted second waits a second.
+  ``items[{id, rows[{date, base{clicks, spent}}]}]``; ``spent`` is net of VAT. One unknown id
+  fails the whole request with 400 ``ERR_WRONG_ADPLANS``.
+- Limits are counted per method and come in ``X-RateLimit-{RPS,Hourly,Daily}-Remaining``
+  headers of its answers; 429 means "too many". A read whose method used up its hour or day
+  waits for the next one; an exhausted second waits a second. Changes (pauses above all)
+  are never held back: they are sent, and a 429 is retried after 2, 5 and 10 s — a refused
+  change was not made, and setting a status or a budget twice does no harm.
 """
 
 from __future__ import annotations
@@ -36,6 +42,7 @@ from app.core.clock import Clock
 from app.promo.platforms import (
     BAD_RESPONSE,
     UNSUPPORTED_BUDGET,
+    AdApiError,
     AuthError,
     Budget,
     BudgetKind,
@@ -47,6 +54,7 @@ from app.promo.platforms import (
     PlatformError,
     RateLimited,
     SpendByDay,
+    SpendLimit,
     SpendRow,
     Transient,
     chunks,
@@ -63,9 +71,12 @@ REFRESH_MARGIN = timedelta(minutes=10)
 DEFAULT_TOKEN_LIFETIME = 86400
 PAGE_LIMIT = 50  # ad_plans.json returns at most 50 items per page
 BATCH_LIMIT = 200  # statistics and mass_action take at most 200 objects
+WRITE_RETRY_DELAYS = (2.0, 5.0, 10.0)  # a change refused with 429 is sent again after these waits
 MOSCOW = timezone(timedelta(hours=3))  # VK counts daily limits by Moscow days; Moscow has no DST
 _STATES = {"active": CampaignState.ACTIVE, "blocked": CampaignState.PAUSED}
 _RETRY_WITH_NEW_TOKEN = frozenset({"expired_token", "invalid_token"})
+_TOKEN_PATH = "v2/oauth2/token.json"
+_MASS_ACTION_PATH = "v2/ad_plans/mass_action.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,8 +94,16 @@ class TokenStore(Protocol):
     async def clear(self) -> None: ...
 
 
-class _TokenLimit(Exception):
-    """VK refused a new token: 5 already exist for this client and user."""
+class _TokenLimit(AdApiError):
+    """VK refused a token with 403: 5 already exist for this client and user."""
+
+
+@dataclass(slots=True)
+class _MethodLimits:
+    """What the last answers of one method said about its limits."""
+
+    blocked_until: datetime | None = None
+    second_used_up: bool = False
 
 
 class VkAdsClient:
@@ -109,8 +128,7 @@ class VkAdsClient:
         self._base = base_url.rstrip("/") + "/"
         self._http = http or HttpClient()
         self._token_lock = asyncio.Lock()
-        self._blocked_until: datetime | None = None
-        self._second_used_up = False
+        self._limits: dict[str, _MethodLimits] = {}
 
     async def close(self) -> None:
         await self._http.close()
@@ -120,7 +138,7 @@ class VkAdsClient:
     async def list_campaigns(self, ids: Sequence[str]) -> list[CampaignInfo]:
         campaigns = []
         for batch in chunks(ids, PAGE_LIMIT):
-            data = await self._json("GET", "v2/ad_plans.json", params={
+            data = await self._json("v2/ad_plans.json", params={
                 "_id__in": ",".join(batch),
                 "fields": "id,name,status,budget_limit_day,budget_limit",
                 "limit": str(PAGE_LIMIT),
@@ -143,7 +161,7 @@ class VkAdsClient:
     async def daily_spend(self, ids: Sequence[str], date_from: date, date_to: date) -> SpendByDay:
         spend: SpendByDay = {}
         for batch in chunks(ids, BATCH_LIMIT):
-            data = await self._json("GET", "v2/statistics/ad_plans/day.json", params={
+            data = await self._json("v2/statistics/ad_plans/day.json", params={
                 "id": ",".join(batch),
                 "date_from": date_from.isoformat(),
                 "date_to": date_to.isoformat(),
@@ -153,16 +171,21 @@ class VkAdsClient:
         return spend
 
     def _campaign(self, item: Mapping[str, Any]) -> CampaignInfo:
-        day_limit = _decimal(item.get("budget_limit_day"))
-        budget = None
-        if day_limit is not None and day_limit > 0:
-            budget = Budget(gross_kop(kop_from_rub(day_limit), self._vat), BudgetKind.DAY)
         return CampaignInfo(
             id=str(item.get("id", "")),
             name=str(item.get("name") or ""),
             state=_STATES.get(str(item.get("status")), CampaignState.OTHER),
-            budget=budget,
+            budget=self._gross_budget(item.get("budget_limit_day")),
+            limit=self._gross_limit(item.get("budget_limit")),
         )
+
+    def _gross_budget(self, value: Any) -> Budget | None:
+        net = _positive(value)
+        return None if net is None else Budget(gross_kop(kop_from_rub(net), self._vat), BudgetKind.DAY)
+
+    def _gross_limit(self, value: Any) -> SpendLimit | None:
+        net = _positive(value)
+        return None if net is None else SpendLimit(gross_kop(kop_from_rub(net), self._vat))
 
     def _spend(self, data: Mapping[str, Any]) -> SpendByDay:
         spend: SpendByDay = {}
@@ -182,12 +205,20 @@ class VkAdsClient:
         return spend
 
     async def _mass_action(self, change: Mapping[str, Any]) -> None:
-        await self._request("POST", "v2/ad_plans/mass_action.json", json_body=[dict(change)])
+        for delay in (*WRITE_RETRY_DELAYS, None):
+            try:
+                await self._request("POST", _MASS_ACTION_PATH, json_body=[dict(change)])
+                return
+            except RateLimited:
+                if delay is None:
+                    raise
+                log.warning("vk ads change refused as too many; retrying", extra={"delay": delay})
+                await self._clock.sleep(delay)
 
     # --- requests -------------------------------------------------------------------------------------------
 
-    async def _json(self, method: str, path: str, *, params: Mapping[str, str]) -> dict[str, Any]:
-        return (await self._request(method, path, params=params)).json()
+    async def _json(self, path: str, *, params: Mapping[str, str]) -> dict[str, Any]:
+        return (await self._request("GET", path, params=params)).json()
 
     async def _request(
         self, method: str, path: str, *, params: Mapping[str, str] | None = None, json_body: Any = None
@@ -213,27 +244,30 @@ class VkAdsClient:
                                 json_body=json_body)
 
     async def _send(self, method: str, path: str, **kwargs: Any) -> HttpReply:
-        await self._respect_limits()
+        limits = self._limits.setdefault(f"{method} {path}", _MethodLimits())
+        await self._respect(limits, hold_back=method == "GET")
         reply = await self._http.request(method, self._base + path, **kwargs)
-        self._remember_limits(reply.headers)
+        self._remember(limits, reply.headers)
         return reply
 
-    async def _respect_limits(self) -> None:
-        if self._blocked_until is not None and self._clock.now() < self._blocked_until:
-            raise RateLimited(f"VK Ads request limit is used up until {self._blocked_until.isoformat()}")
-        if self._second_used_up:
-            self._second_used_up = False
+    async def _respect(self, limits: _MethodLimits, *, hold_back: bool) -> None:
+        """Wait out a used-up second; reads also wait for a used-up hour or day (changes never do)."""
+        if hold_back and limits.blocked_until is not None and self._clock.now() < limits.blocked_until:
+            raise RateLimited(f"VK Ads request limit is used up until {limits.blocked_until.isoformat()}")
+        if limits.second_used_up:
+            limits.second_used_up = False
             await self._clock.sleep(1.0)
 
-    def _remember_limits(self, headers: Mapping[str, str]) -> None:
+    def _remember(self, limits: _MethodLimits, headers: Mapping[str, str]) -> None:
         now = self._clock.now()
+        limits.blocked_until = None
         if response_int(headers.get("X-RateLimit-Daily-Remaining")) == 0:
             local = now.astimezone(MOSCOW)
-            self._blocked_until = datetime.combine(local.date() + timedelta(days=1), datetime.min.time(),
-                                                   tzinfo=MOSCOW)
+            limits.blocked_until = datetime.combine(local.date() + timedelta(days=1), datetime.min.time(),
+                                                    tzinfo=MOSCOW)
         elif response_int(headers.get("X-RateLimit-Hourly-Remaining")) == 0:
-            self._blocked_until = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-        self._second_used_up = response_int(headers.get("X-RateLimit-RPS-Remaining")) == 0
+            limits.blocked_until = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        limits.second_used_up = response_int(headers.get("X-RateLimit-RPS-Remaining")) == 0
 
     # --- tokens (never logged) -----------------------------------------------------------------------------------
 
@@ -249,14 +283,16 @@ class VkAdsClient:
             return token.access_token
 
     async def _renewed(self, stored: StoredToken) -> StoredToken | None:
-        """Refresh the pair; None when VK refuses the refresh token (then a new pair is issued)."""
+        """Refresh the pair; None when VK refuses the refresh (then a new pair is issued)."""
         try:
             return await self._grant({"grant_type": "refresh_token", "refresh_token": stored.refresh_token or ""})
         except AuthError as error:
             if error.code == "invalid_client":
                 raise
             log.warning("vk ads refresh token refused; requesting a new token", extra={"code": error.code})
-            return None
+        except _TokenLimit:
+            log.warning("vk ads refresh refused with 403; requesting a new token")
+        return None
 
     async def _issue(self) -> StoredToken:
         try:
@@ -271,11 +307,11 @@ class VkAdsClient:
             raise AuthError("token_limit", "") from error
 
     async def _grant(self, form: Mapping[str, str]) -> StoredToken:
-        reply = await self._send("POST", "v2/oauth2/token.json", form={
+        reply = await self._send("POST", _TOKEN_PATH, form={
             **form, "client_id": self._client_id, "client_secret": self._client_secret})
         data = reply.json()
         if reply.status == 403:
-            raise _TokenLimit()
+            raise _TokenLimit("token request refused with HTTP 403")
         if reply.status in (400, 401):
             raise AuthError(_token_error(reply), str(data.get("error_description") or data.get("message") or ""))
         _raise_for_status(reply)
@@ -337,12 +373,12 @@ def _items(data: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
 
 
-def _decimal(value: Any) -> Decimal | None:
-    """A finite amount from a lenient JSON value ("385.24", 385.24); None otherwise."""
+def _positive(value: Any) -> Decimal | None:
+    """A positive finite amount from a lenient JSON value ("385.24", 385.24); None otherwise."""
     if value is None or isinstance(value, bool):
         return None
     try:
         number = Decimal(str(value))
     except ArithmeticError:
         return None
-    return number if number.is_finite() else None
+    return number if number.is_finite() and number > 0 else None

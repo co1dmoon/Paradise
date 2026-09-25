@@ -10,13 +10,18 @@ CREATE TABLE promo_campaigns (
     name                   TEXT    NOT NULL,
     state                  TEXT    NOT NULL DEFAULT 'other' CHECK (state IN ('active', 'paused', 'other')),
     budget_kind            TEXT    CHECK (budget_kind IN ('week', 'day')),
-    budget_kop             INTEGER,              -- last known budget, gross
-    plan_budget_kop        INTEGER,              -- the budget when registered, gross
-    plan_budget_kind       TEXT    CHECK (plan_budget_kind IN ('week', 'day')),
+    budget_kop             INTEGER,              -- last known budget the autopilot may change, gross
+    previous_budget_kop    INTEGER,              -- the budget(s) before the change on last_budget_change_day
+    limit_kop              INTEGER,              -- a limit on total spend (VK: whole campaign, Direct: period)
+    limit_start            TEXT,                 -- the limit's period (Direct); empty: the whole campaign
+    limit_end              TEXT,
+    pays_per_conversion    INTEGER NOT NULL DEFAULT 0,
     registered_at          TEXT    NOT NULL,
     enabled                INTEGER NOT NULL DEFAULT 1,
     last_budget_change_day TEXT,
-    paused_by              TEXT    CHECK (paused_by IN ('autopilot', 'admin', 'cap', 'season')),
+    paused_by              TEXT    CHECK (paused_by IN ('autopilot', 'admin', 'cap', 'season', 'preseason')),
+    changed_at             TEXT,                 -- the bot's last change of state or budget (older fetches lose)
+    spend_checked_at       TEXT,                 -- when the spend was last fetched from the platform
     UNIQUE (platform, external_id)
 );
 
@@ -53,13 +58,14 @@ CREATE TABLE promo_links (
     created_by INTEGER NOT NULL
 );
 
--- Posts of the season calendar handed to the outbox for the owner's channel, or skipped
--- because they were more than a day overdue.
+-- Posts of the season calendar handed to the outbox for the owner's channel, skipped because
+-- they were more than a day overdue, or refused by MAX (failed; /channel send tries again).
 CREATE TABLE promo_posts_sent (
-    post_id TEXT PRIMARY KEY,
-    sent_at TEXT NOT NULL,
-    mid     TEXT,
-    status  TEXT NOT NULL DEFAULT 'sent' CHECK (status IN ('sent', 'skipped'))
+    post_id   TEXT    PRIMARY KEY,
+    sent_at   TEXT    NOT NULL,
+    mid       TEXT,
+    status    TEXT    NOT NULL DEFAULT 'sent' CHECK (status IN ('sent', 'skipped', 'failed')),
+    outbox_id INTEGER                          -- the outbox row of the last attempt
 );
 
 -- The VK Ads OAuth token pair (at most 5 tokens per client and user: reuse, refresh, never hoard).

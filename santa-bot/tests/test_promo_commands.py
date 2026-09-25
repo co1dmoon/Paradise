@@ -51,8 +51,20 @@ async def test_ads_add_checks_the_campaign_and_gives_the_tracking_links(bot: Bot
     assert f"\n{SITE}/?src=yd{{campaign_id}}\n" in reply, "one URL for every Direct campaign"
     assert "Проверить кампанию не смог" not in reply
     campaign = await store.get_campaign(bot.ctx.db, "yd701234567")
-    assert campaign is not None and campaign.plan_budget == Budget(3000_00, WEEK)
+    assert campaign is not None and campaign.budget == Budget(3000_00, WEEK)
     assert campaign.state == CampaignState.ACTIVE
+    assert "ВНИМАНИЕ" not in reply
+
+
+async def test_ads_add_warns_loudly_about_a_budget_it_cannot_see(bot: Bot, admin: FakeUser,
+                                                                 direct: FakeAdPlatform) -> None:
+    direct.add("703", "Ручная стратегия")  # e.g. a manual strategy: no weekly budget or budget for a period
+
+    await bot(admin.say("/ads add yd 703"))
+
+    assert ("ВНИМАНИЕ: не вижу бюджета этой кампании. Без него я не удержу общий лимит расходов, поэтому в режиме "
+            "автопилота остановлю её и не дам запустить. Поставьте недельный бюджет стратегии в Директе") in (
+        admin.last_text)
 
 
 async def test_ads_add_vk_without_credentials_registers_with_a_warning(bot: Bot, admin: FakeUser) -> None:
@@ -121,7 +133,7 @@ async def test_ads_stop_and_resume(bot: Bot, admin: FakeUser, direct: FakeAdPlat
     await bot(admin.say("/ads stop"))
 
     assert direct.mutations() == [("suspend", "701234567"), ("suspend", "702")]
-    assert admin.last_text == ("Остановил все кампании (автопилот их больше не запустит):\n"
+    assert admin.last_text == ("Остановил все подключённые кампании (автопилот их больше не запустит):\n"
                                "«Тайный Санта — поиск» — остановлена\n«Запасная» — остановлена\n"
                                "Запустить снова: /ads resume ИСТОЧНИК.")
     stopped = await store.get_campaign(bot.ctx.db, "yd702")
@@ -135,7 +147,8 @@ async def test_ads_stop_and_resume(bot: Bot, admin: FakeUser, direct: FakeAdPlat
 
     await store.set_settings(bot.ctx.db, cap_rub=500)
     await bot(admin.say("/ads resume yd701234567"))
-    assert admin.last_text == texts.promo_over_cap(cap_kop=500_00, projected_kop=429_00 + 300_00)
+    # a day of a weekly budget: 45.5% of it (35% of the week and what may be carried over from the last one)
+    assert admin.last_text == texts.promo_over_cap(cap_kop=500_00, projected_kop=1365_00 + 955_50)
     travel(clock, msk(13, month=12))
     await bot(admin.say("/ads resume yd701234567"))
     assert admin.last_text == texts.promo_resume_out_of_season(ended=True)
@@ -153,18 +166,51 @@ async def test_ads_budget(bot: Bot, admin: FakeUser, direct: FakeAdPlatform) -> 
     assert admin.last_text == ("Бюджет «Тайный Санта — поиск»: 2 000 ₽ в неделю с НДС, в кабинете будет "
                                "1 639,34 ₽ без НДС.")
     campaign = await store.get_campaign(bot.ctx.db, "yd701234567")
-    assert campaign is not None and campaign.budget == Budget(2000_00, WEEK)
+    assert campaign is not None and campaign.budget == Budget(1999_99, WEEK), "as Direct will report 1 639,34 ₽"
+    assert (campaign.previous_budget_kop, campaign.last_budget_change_day) == (3000_00, date(2026, 11, 20))
     await bot(admin.say("/ads budget yd701234567 300"))
     assert admin.last_text == texts.promo_budget_too_small(366_00)
     await store.set_settings(bot.ctx.db, cap_rub=1000)
     await bot(admin.say("/ads budget yd701234567 20000"))
-    assert admin.last_text.startswith("Не делаю: с этим расходы за следующий день могут дойти до 2 857 ₽")
+    assert admin.last_text.startswith("Не делаю: с этим расходы за следующий день могут дойти до 11 375 ₽"), (
+        "the budgets replaced today (3 000 and 2 000 ₽) still count today: 45.5% of 25 000 ₽")
+    await store.set_settings(bot.ctx.db, cap_rub=15000)
     direct.fail("set_budget", AuthError("53"))
     await bot(admin.say("/ads budget yd701234567 400"))
     assert admin.last_text.startswith("Не удалось поменять бюджет «Тайный Санта — поиск»: площадка не приняла ключи")
     for bad in ("/ads budget yd701234567", "/ads budget yd701234567 много", "/ads budget 2000"):
         await bot(admin.say(bad))
         assert admin.last_text == texts.PROMO_BUDGET_USAGE, bad
+    assert "для Директа за неделю, для VK Рекламы за день" in texts.PROMO_BUDGET_USAGE
+
+
+async def test_a_large_budget_change_waits_for_a_tap(bot: Bot, admin: FakeUser, direct: FakeAdPlatform) -> None:
+    """Finding 12: a weekly figure typed for VK became a daily budget without a word."""
+    vk = FakeAdPlatform(Platform.VK)
+    vk.add("55", "Сайт", budget=Budget(500_00, BudgetKind.DAY))
+    bot.ctx.ad_platforms[Platform.VK] = vk
+    await bot(admin.say("/ads add vk 55"))
+
+    await bot(admin.say("/ads budget vk55 2440"))
+
+    assert vk.mutations() == []
+    assert admin.last_text == ("Проверьте: бюджет «Сайт» станет 2 440 ₽ в день с НДС (сейчас 500 ₽), в кабинете — "
+                               "2 000,00 ₽ без НДС. Поставить?")
+    assert admin.button_texts == ["Да, 2 440 ₽ в день", "Не надо"]
+    await bot(admin.press("Не надо"))
+    assert admin.screen_text == "Хорошо, бюджет «Сайт» оставляю 500 ₽." and vk.mutations() == []
+
+    await bot(admin.say("/ads budget vk55 600"))  # +20%: at once
+    assert vk.mutations() == [("set_budget", "55", 600_00, BudgetKind.DAY)]
+
+    await bot(admin.say("/ads add yd 701234567"))
+    await bot(admin.say("/ads budget yd701234567 5000"))
+    assert admin.last_text.endswith("В Директе после изменения неделя бюджета начнётся заново, и сегодня могут "
+                                    "тратиться оба бюджета — до 3 640 ₽ за день. Поставить?")
+    await bot(admin.press("Да, 5 000 ₽ в неделю"))
+    assert direct.mutations() == [("set_budget", "701234567", 5000_00, WEEK)]
+    assert admin.screen_text == ("Бюджет «Тайный Санта — поиск»: 5 000 ₽ в неделю с НДС, в кабинете будет "
+                                 "4 098,36 ₽ без НДС.")
 
 
 async def test_ads_cap_rules_and_remove(bot: Bot, admin: FakeUser, direct: FakeAdPlatform) -> None:
@@ -185,8 +231,11 @@ async def test_ads_cap_rules_and_remove(bot: Bot, admin: FakeUser, direct: FakeA
         assert admin.last_text in (texts.PROMO_RULES_USAGE, texts.PROMO_CAP_USAGE), bad
     await bot(admin.say("/ads add yd 702"))
     await bot(admin.say("/ads remove yd702"))
-    assert admin.last_text == texts.promo_removed(name="Запасная", src="yd702")
+    assert admin.last_text == texts.promo_removed(name="Запасная", src="yd702", running=True)
+    assert "дальнейшие расходы я не считаю, и в конце сезона не остановлю" in admin.last_text
     assert await store.enabled_campaigns(bot.ctx.db) == [] and direct.mutations() == []
+    await bot(admin.press(texts.BTN_PROMO_STOP_REMOVED))
+    assert admin.screen_text == texts.promo_stopped_one("Запасная") and direct.mutations() == [("suspend", "702")]
     await bot(admin.say("/ads remove yd702"))
     assert admin.last_text == texts.promo_unknown_src("yd702")
     await bot(admin.say("/ads remove"))
@@ -221,7 +270,7 @@ async def test_channel_commands(bot: Bot, admin: FakeUser, api: FakeMaxApi, cloc
     await bot(admin.say("/channel"))
     status = admin.last_text
     assert status.startswith("Посты в канал MAX: выключены. Канал: -500.\nКалендарь: 16 постов, отправлено 0, "
-                             "пропущено 0.\nСледующие:")
+                             "пропущено 0, не ушло 0.\nСледующие:")
     assert ("Следующие:\nch05 — 19 ноября, 12:00: Бюджет подарка: как договориться и никого не смутить\n"
             "ch06 — 23 ноября, 12:00: 10 идей подарков до 500 ₽\n"
             "ch07 — 26 ноября, 12:00: 10 идей подарков до 1000 ₽\n") in status, "a post a day late still goes out"
@@ -233,7 +282,17 @@ async def test_channel_commands(bot: Bot, admin: FakeUser, api: FakeMaxApi, cloc
     assert [button.text for button in post.buttons] == [texts.BTN_PROMO_CHANNEL]
 
     await bot(admin.say("/channel on"))
-    assert admin.last_text == texts.channel_on(channel_id=-500) and (await store.get_settings(bot.ctx.db)).channel_on
+    assert admin.last_text == texts.channel_on(channel_id=-500, unmarked=True)
+    assert (await store.get_settings(bot.ctx.db)).channel_on
+    assert "ВНИМАНИЕ: посты уходят без маркировки" in admin.last_text, "finding 7: the button makes it an ad"
+    await bot(admin.say("/channel"))
+    assert "ВНИМАНИЕ: посты уходят без маркировки" in admin.last_text
+    config = bot.ctx.config
+    bot.ctx.config = dataclasses.replace(config, promo=dataclasses.replace(
+        config.promo, channel_ad_label="Реклама. Иванов И. И., ИНН 123456789012, erid: 2Vtzq"))
+    await bot(admin.say("/channel"))
+    assert "без маркировки" not in admin.last_text
+    bot.ctx.config = config
     await bot(admin.say("/channel off"))
     assert admin.last_text == texts.CHANNEL_OFF
 

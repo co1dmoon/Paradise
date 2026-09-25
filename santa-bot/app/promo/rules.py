@@ -1,19 +1,35 @@
-"""The autopilot's decisions (PROMO_SPEC §5): pure functions of the facts, no I/O.
+"""The autopilot's decisions (PROMO_SPEC §5 and its Implementation notes): pure functions of the facts, no I/O.
 
 Order of evaluation:
-1. Season window: outside PROMO_START..PROMO_END every active campaign is paused; nothing
-   else is evaluated.
-2. Hard cap: when the gross spend so far plus one more day of the active budgets could
-   cross the cap, every active campaign is paused; nothing else is evaluated.
-3. Expensive: a campaign whose matured spend reached the minimum and brought no game with
+1. Season window: outside PROMO_START..PROMO_END every active campaign is paused (as waiting
+   for the season before it, as over after it); nothing else is evaluated.
+2. Blind budgets: an active campaign whose spend nothing visible limits is paused on its own;
+   the others are judged without it.
+3. Hard cap: when the gross spend so far plus one more day of every active campaign could
+   cross the cap, every active campaign is paused, and those waiting for the season stay
+   paused for the cap; nothing else is evaluated.
+4. Season start: campaigns paused before the season start again, each only if the cap holds
+   with it and its numbers are fresh; otherwise they stay paused for the cap (or a blind budget).
+5. Expensive: a campaign whose matured spend reached the minimum and brought no game with
    3+ participants, or brought them dearer than the pause threshold, is paused.
-4. Cheap: a campaign whose matured games cost less than the scale threshold gets a budget
+6. Cheap: a campaign whose matured games cost less than the scale threshold gets a budget
    raise (at most +max_raise_pct, never past the cap), which an admin must approve.
 
-Pauses (1–3) need no approval. A campaign an admin paused is never touched by rules 3–4.
-"Matured" numbers count only people first seen, and money spent, before the cohort
-cutoff (today minus PROMO_LAG_DAYS), so a game has time to gather its participants.
-Money is gross integer kopecks.
+Rules 1–3 are also the guard's (``protect``). Only raises need approval. A campaign an admin
+paused is never touched by rules 5–6; raises and season starts need fresh numbers.
+"Matured" numbers count only people first seen, and money spent, before the cohort cutoff
+(today minus PROMO_LAG_DAYS), so a game has time to gather its participants.
+
+One more day of spend (``day_exposure``) is the smallest of what is visible:
+- VK's daily budget;
+- Direct's weekly budget: a day may take 35% of the week plus the rest carried over from last
+  week (at most 30% of it), so 45.5% when paying per click, and all of it when paying per
+  conversion (all the conversions may come on one day). A change restarts the week, and on
+  its day the old budget still counts: «35% от старого бюджета + 35% от нового», «100% старого
+  + 100% нового» (yandex.ru/support/direct/ru/strategies/week-budget);
+- a limit on total spend (VK's budget for the whole campaign, Direct's budget for a period):
+  what is left of it.
+With none of these the budget is blind. Money is gross integer kopecks.
 """
 
 from __future__ import annotations
@@ -26,9 +42,9 @@ from typing import Any
 
 from app.core import texts
 from app.core.dates import in_season_window
-from app.promo.platforms import Budget, BudgetKind, CampaignState, Platform
+from app.promo.platforms import Budget, BudgetKind, CampaignState, Platform, SpendLimit
 
-DIRECT_DAY_SHARE_PCT = 35  # Direct may spend up to 35% of a weekly budget in one day
+PER_CLICK_DAY_PERMILLE = 455  # Direct, paying per click: 35% of (the week + at most 30% carried over)
 RAISE_STEP_KOP = 10_00  # raised budgets are rounded down to 10 ₽
 MIN_RAISE_KOP = 50_00  # a smaller raise is not worth an admin's tap
 MIN_GAMES_TO_RAISE = 2
@@ -38,7 +54,8 @@ class PausedBy(StrEnum):
     AUTOPILOT = "autopilot"
     ADMIN = "admin"
     CAP = "cap"
-    SEASON = "season"
+    SEASON = "season"  # the season is over
+    PRESEASON = "preseason"  # the season has not started: started again when it does
 
 
 class ActionKind(StrEnum):
@@ -54,20 +71,28 @@ class CampaignFacts:
     platform: Platform
     name: str
     state: CampaignState
-    budget: Budget | None  # gross; None when the platform shows none
-    plan_budget: Budget | None  # the budget when the campaign was registered
+    budget: Budget | None  # gross; the one the autopilot may change
+    limit: SpendLimit | None  # a limit on total spend, gross
+    pays_per_conversion: bool
+    previous_budget_kop: int | None  # what was replaced on last_budget_change_day
+    last_budget_change_day: date | None
     spend_total_kop: int
     spend_matured_kop: int
     spend_yesterday_kop: int
+    spend_in_limit_kop: int  # the spend that counts against ``limit``
     games3: int
     games3_matured: int
     paid_rub: int
-    last_budget_change_day: date | None
     paused_by: PausedBy | None
+    fresh: bool  # the spend was fetched recently enough to raise a budget or start the campaign
 
     @property
     def active(self) -> bool:
         return self.state == CampaignState.ACTIVE
+
+    @property
+    def waiting_for_season(self) -> bool:
+        return self.state == CampaignState.PAUSED and self.paused_by == PausedBy.PRESEASON
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,18 +125,26 @@ class Decision:
 
 
 def decide(campaigns: Sequence[CampaignFacts], situation: Situation) -> list[Decision]:
-    """Rules 1–4 in order."""
-    stops = protect(campaigns, situation)
+    """Rules 1–6 in order."""
+    if not in_season(situation):
+        return _season(campaigns, situation)
+    blind = _blind(campaigns, situation)
+    campaigns = _after(campaigns, blind)
+    stops = _cap(campaigns, situation)
     if stops:
-        return stops
-    pauses = _expensive(campaigns, situation)
-    paused = {decision.src for decision in pauses}
-    return [*pauses, *_cheap([c for c in campaigns if c.src not in paused], situation)]
+        return [*blind, *stops]
+    starts = _season_start(campaigns, situation)
+    campaigns = _after(campaigns, starts)
+    expensive = _expensive(campaigns, situation)
+    return [*blind, *starts, *expensive, *_cheap(_after(campaigns, expensive), situation)]
 
 
 def protect(campaigns: Sequence[CampaignFacts], situation: Situation) -> list[Decision]:
-    """Rules 1–2 only: the season window and the hard cap (the guard between daily runs)."""
-    return _season(campaigns, situation) or _cap(campaigns, situation)
+    """Rules 1–3 only: the season window, blind budgets and the hard cap (the guard between daily runs)."""
+    if not in_season(situation):
+        return _season(campaigns, situation)
+    blind = _blind(campaigns, situation)
+    return [*blind, *_cap(_after(campaigns, blind), situation)]
 
 
 def in_season(situation: Situation) -> bool:
@@ -125,57 +158,85 @@ def season_ended(situation: Situation) -> bool:
     return mark > end or start > end
 
 
-def day_equivalent(budget: Budget) -> int:
-    """One day of a budget: a daily budget itself, a weekly one divided by 7 (rounded up)."""
-    return budget.kop if budget.kind == BudgetKind.DAY else -(-budget.kop // 7)
-
-
-def day_spend_kop(campaign: CampaignFacts, remaining_kop: int) -> int:
-    """What an active campaign may spend in one more day.
-
-    With an unknown budget: 35% of the weekly budget it had when registered (Direct), its
-    daily budget then (VK), and when nothing is known, all that is left under the cap.
-    """
+def day_exposure(campaign: CampaignFacts, today: date) -> int | None:
+    """The most a running campaign may spend in one more day; None when nothing visible limits it."""
+    bounds = []
     if campaign.budget is not None:
-        return day_equivalent(campaign.budget)
-    plan = campaign.plan_budget
-    if plan is None:
-        return max(remaining_kop, 1)  # an active campaign can always spend something
-    if campaign.platform == Platform.DIRECT and plan.kind == BudgetKind.WEEK:
-        return -(-plan.kop * DIRECT_DAY_SHARE_PCT // 100)
-    return day_equivalent(plan)
+        bounds.append(_budget_day(campaign, campaign.budget, today))
+    if campaign.limit is not None:
+        bounds.append(_limit_left(campaign.limit, campaign.spend_in_limit_kop, today))
+    return min(bounds) if bounds else None
+
+
+def budget_visible(campaign: CampaignFacts, today: date) -> bool:
+    return day_exposure(campaign, today) is not None
 
 
 def projected_kop(campaigns: Sequence[CampaignFacts], situation: Situation) -> int:
-    """Spend so far plus one more day of every active campaign."""
-    remaining = situation.cap_kop - situation.spent_total_kop
-    return situation.spent_total_kop + sum(day_spend_kop(c, remaining) for c in campaigns if c.active)
+    """Spend so far plus one more day of every active campaign with a visible budget (blind ones are
+    paused on their own by rule 2)."""
+    days = (day_exposure(c, situation.today) for c in campaigns if c.active)
+    return situation.spent_total_kop + sum(day for day in days if day is not None)
 
 
 def cap_holds(campaigns: Sequence[CampaignFacts], situation: Situation) -> bool:
     return projected_kop(campaigns, situation) <= situation.cap_kop
 
 
-def with_change(
-    campaigns: Sequence[CampaignFacts], src: str, *, state: CampaignState | None = None, budget: Budget | None = None
-) -> list[CampaignFacts]:
-    """The facts as they would be after resuming a campaign or changing its budget (for cap checks)."""
-    changes: dict[str, Any] = {}
-    if state is not None:
-        changes["state"] = state
-    if budget is not None:
-        changes["budget"] = budget
-    return [replace(c, **changes) if c.src == src else c for c in campaigns]
+def with_state(campaigns: Sequence[CampaignFacts], src: str, state: CampaignState) -> list[CampaignFacts]:
+    """The facts as they would be after resuming (or pausing) a campaign."""
+    return [replace(c, state=state) if c.src == src else c for c in campaigns]
 
 
-# --- the rules -----------------------------------------------------------------------------------------
+def with_budget(campaigns: Sequence[CampaignFacts], src: str, budget: Budget, today: date) -> list[CampaignFacts]:
+    """The facts as they would be after changing a budget today: the replaced one still counts today."""
+    return [replace(c, budget=budget, previous_budget_kop=_replaced_today(c, today), last_budget_change_day=today)
+            if c.src == src else c for c in campaigns]
+
+
+# --- one more day ---------------------------------------------------------------------------------------
+
+
+def _budget_day(campaign: CampaignFacts, budget: Budget, today: date) -> int:
+    if budget.kind == BudgetKind.DAY:
+        return budget.kop
+    week = budget.kop + (campaign.previous_budget_kop or 0 if campaign.last_budget_change_day == today else 0)
+    return week if campaign.pays_per_conversion else -(-week * PER_CLICK_DAY_PERMILLE // 1000)
+
+
+def _limit_left(limit: SpendLimit, spent_kop: int, today: date) -> int:
+    if limit.start is not None and limit.end is not None and not limit.start <= today <= limit.end:
+        return limit.kop  # a period that is not the stored one: the whole limit
+    return max(limit.kop - spent_kop, 0)
+
+
+def _replaced_today(campaign: CampaignFacts, today: date) -> int:
+    """The budgets that still count today once the current one is replaced."""
+    earlier = campaign.previous_budget_kop or 0 if campaign.last_budget_change_day == today else 0
+    return earlier + (campaign.budget.kop if campaign.budget else 0)
+
+
+def _largest_budget(campaign: CampaignFacts, budget: Budget, room_kop: int) -> int:
+    """The largest budget whose day — changed today, so the current one still counts — fits ``room_kop``."""
+    if budget.kind == BudgetKind.DAY:
+        return room_kop
+    per_mille = 1000 if campaign.pays_per_conversion else PER_CLICK_DAY_PERMILLE
+    return room_kop * 1000 // per_mille - budget.kop
+
+
+# --- the rules ---------------------------------------------------------------------------------------------
 
 
 def _season(campaigns: Sequence[CampaignFacts], situation: Situation) -> list[Decision]:
-    if in_season(situation):
-        return []
-    reason = texts.promo_reason_season(ended=season_ended(situation))
-    return [_pause(c, PausedBy.SEASON, reason) for c in campaigns if c.active]
+    ended = season_ended(situation)
+    paused_by = PausedBy.SEASON if ended else PausedBy.PRESEASON
+    reason = texts.promo_reason_season(ended=ended)
+    return [_pause(c, paused_by, reason) for c in campaigns if c.active]
+
+
+def _blind(campaigns: Sequence[CampaignFacts], situation: Situation) -> list[Decision]:
+    return [_pause(c, PausedBy.AUTOPILOT, texts.PROMO_REASON_BLIND) for c in campaigns
+            if c.active and not budget_visible(c, situation.today)]
 
 
 def _cap(campaigns: Sequence[CampaignFacts], situation: Situation) -> list[Decision]:
@@ -184,7 +245,29 @@ def _cap(campaigns: Sequence[CampaignFacts], situation: Situation) -> list[Decis
         return []
     reason = texts.promo_reason_cap(cap_kop=situation.cap_kop, spent_kop=situation.spent_total_kop,
                                     projected_kop=projected)
-    return [_pause(c, PausedBy.CAP, reason) for c in campaigns if c.active]
+    return [_pause(c, PausedBy.CAP, reason) for c in campaigns if c.active or c.waiting_for_season]
+
+
+def _season_start(campaigns: Sequence[CampaignFacts], situation: Situation) -> list[Decision]:
+    """Campaigns paused before the season start again while the room under the cap lasts."""
+    room = situation.cap_kop - projected_kop(campaigns, situation)
+    decisions = []
+    for c in campaigns:
+        if not c.waiting_for_season:
+            continue
+        day = day_exposure(c, situation.today)
+        if day is None:
+            decisions.append(_pause(c, PausedBy.AUTOPILOT, texts.PROMO_REASON_BLIND))
+        elif not c.fresh:
+            continue  # started once its numbers are fresh again
+        elif day <= room:
+            decisions.append(Decision(c.src, ActionKind.RESUME, texts.PROMO_REASON_SEASON_STARTED))
+            room -= day
+        else:
+            reason = texts.promo_reason_cap(cap_kop=situation.cap_kop, spent_kop=situation.spent_total_kop,
+                                            projected_kop=situation.cap_kop - room + day)
+            decisions.append(_pause(c, PausedBy.CAP, reason))
+    return decisions
 
 
 def _expensive(campaigns: Sequence[CampaignFacts], situation: Situation) -> list[Decision]:
@@ -203,30 +286,31 @@ def _expensive(campaigns: Sequence[CampaignFacts], situation: Situation) -> list
 
 def _cheap(campaigns: Sequence[CampaignFacts], situation: Situation) -> list[Decision]:
     """Raises for cheap campaigns; each one takes its share of the room under the cap in turn."""
-    rules = situation.thresholds
+    rules, today = situation.thresholds, situation.today
     room = situation.cap_kop - projected_kop(campaigns, situation)
     decisions = []
     for c in _managed(campaigns):
-        budget = c.budget
-        if budget is None or c.last_budget_change_day == situation.today:
+        budget, day = c.budget, day_exposure(c, today)
+        if budget is None or day is None or not c.fresh or c.last_budget_change_day == today:
             continue
         if c.games3_matured < MIN_GAMES_TO_RAISE or c.spend_matured_kop >= rules.scale_cpa_kop * c.games3_matured:
             continue
-        target = _raise_target(budget, room + day_equivalent(budget), rules.max_raise_pct, situation.min_budget_kop)
+        keeps_cap = _largest_budget(c, budget, room + day)
+        target = _raise_target(budget, keeps_cap, rules.max_raise_pct, situation.min_budget_kop)
         if target is None:
             continue
         reason = texts.promo_reason_cheap(until=_last_matured_day(situation), spend_kop=c.spend_matured_kop,
                                           games=c.games3_matured, scale_cpa_kop=rules.scale_cpa_kop)
         params = {"from_kop": budget.kop, "to_kop": target, "kind": budget.kind}
         decisions.append(Decision(c.src, ActionKind.SET_BUDGET, reason, params, needs_approval=True))
-        room -= day_equivalent(Budget(target, budget.kind)) - day_equivalent(budget)
+        (raised,) = with_budget([c], c.src, Budget(target, budget.kind), today)
+        room -= (day_exposure(raised, today) or 0) - day
     return decisions
 
 
-def _raise_target(budget: Budget, room_kop: int, max_raise_pct: int, min_budget_kop: int) -> int | None:
-    """The raised budget: +max_raise_pct at most, within the cap (``room_kop`` is one day of room for
-    this campaign), rounded down to 10 ₽, not below the platform minimum; None below a 50 ₽ raise."""
-    keeps_cap = room_kop if budget.kind == BudgetKind.DAY else room_kop * 7
+def _raise_target(budget: Budget, keeps_cap: int, max_raise_pct: int, min_budget_kop: int) -> int | None:
+    """The raised budget: +max_raise_pct at most, at most ``keeps_cap``, rounded down to 10 ₽, not below
+    the platform minimum; None below a 50 ₽ raise."""
     target = min(budget.kop * (100 + max_raise_pct) // 100, keeps_cap)
     target -= target % RAISE_STEP_KOP
     if target < min_budget_kop <= keeps_cap:
@@ -237,6 +321,17 @@ def _raise_target(budget: Budget, room_kop: int, max_raise_pct: int, min_budget_
 def _managed(campaigns: Sequence[CampaignFacts]) -> list[CampaignFacts]:
     """Active campaigns the rules may act on: not the ones an admin paused."""
     return [c for c in campaigns if c.active and c.paused_by != PausedBy.ADMIN]
+
+
+def _after(campaigns: Sequence[CampaignFacts], decisions: Sequence[Decision]) -> list[CampaignFacts]:
+    """The facts as the pauses and starts of ``decisions`` leave them."""
+    changes: dict[str, dict[str, Any]] = {}
+    for decision in decisions:
+        if decision.action == ActionKind.PAUSE:
+            changes[decision.src] = {"state": CampaignState.PAUSED, "paused_by": decision.params["paused_by"]}
+        elif decision.action == ActionKind.RESUME:
+            changes[decision.src] = {"state": CampaignState.ACTIVE, "paused_by": None}
+    return [replace(c, **changes[c.src]) if c.src in changes else c for c in campaigns]
 
 
 def _pause(campaign: CampaignFacts, paused_by: PausedBy, reason: str) -> Decision:

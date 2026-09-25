@@ -8,6 +8,7 @@ from app.core.clock import Clock
 from app.db import Db
 from app.max_api import BadRequest, MaxApiError, OutMessage, Target
 from app.outbox import PURPOSE_ALERT, PURPOSE_DRAW_RESULT, PURPOSE_PROMO_POST, Outbox, OutboxItem
+from app.promo import store as promo_store
 
 BAD_REQUEST_ALERT_INTERVAL = 5 * 60.0
 
@@ -17,8 +18,8 @@ class DeliveryTracker:
 
     - A draw result (purpose ``draw_result``) sets participants.result_dm_ok; when the
       last result of a draw resolves, the organizer gets the 'Пары отправлены' summary.
-    - A post MAX refused for the owner's channel (purpose ``promo_post``) is reported to the
-      admins with the likely fix (throttled).
+    - A post MAX refused for the owner's channel (purpose ``promo_post``) is marked failed, so
+      /channel send may try it again, and reported to the admins with the likely fix (throttled).
     - BadRequest on any other non-alert message is reported to the admins (throttled).
     - A rejected token (401) is reported to the admins (throttled).
     """
@@ -37,7 +38,8 @@ class DeliveryTracker:
         if item is not None and item.purpose == PURPOSE_DRAW_RESULT:
             await self._draw_result(item, delivered=False)
         if item is not None and item.purpose == PURPOSE_PROMO_POST:
-            await self._alerts.alert("promo_post", texts.promo_post_failed(error.detail),
+            post_id = await promo_store.mark_post_failed(self._db, item.id)
+            await self._alerts.alert("promo_post", texts.promo_post_failed(error=error.detail, post_id=post_id),
                                      min_interval=BAD_REQUEST_ALERT_INTERVAL)
         elif isinstance(error, BadRequest) and (item is None or item.purpose != PURPOSE_ALERT):
             await self._alerts.alert(

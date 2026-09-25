@@ -11,6 +11,7 @@ import pytest
 from app.core.clock import FakeClock
 from app.db import Database
 from app.promo.platforms import (
+    AdApiError,
     AuthError,
     Budget,
     BudgetKind,
@@ -19,6 +20,7 @@ from app.promo.platforms import (
     Platform,
     PlatformError,
     RateLimited,
+    SpendLimit,
     SpendRow,
     Transient,
 )
@@ -125,6 +127,34 @@ async def test_a_persistent_token_limit_is_an_auth_error(server: ScriptedServer,
     assert server.routes() == [TOKEN, DELETE, TOKEN], "the deletion is tried exactly once"
 
 
+async def test_a_refresh_refused_with_403_falls_back_to_a_new_token(server: ScriptedServer, vk: VkAdsClient,
+                                                                    clock: FakeClock) -> None:
+    """Review finding 8: a 403 on the refresh escaped as a plain exception and stopped the daily run."""
+    server.reply(TOKEN, token_reply("access-1"), Reply(403, {"error": "forbidden"}), token_reply("access-2"))
+    server.reply(PLANS, EMPTY_PLANS)
+    server.reply(MASS, Reply(204))
+    await vk.list_campaigns(["55"])
+    clock.advance(86400)
+
+    await vk.suspend("55")
+
+    assert [seen.form.get("grant_type") for seen in server.requests if seen.route == TOKEN] == [
+        "client_credentials", "refresh_token", "client_credentials"]
+    assert server.requests[-1].headers["Authorization"] == "Bearer access-2"
+
+
+async def test_every_token_failure_is_an_ad_api_error(server: ScriptedServer, vk: VkAdsClient,
+                                                      clock: FakeClock) -> None:
+    server.reply(TOKEN, token_reply("access-1"), Reply(403, {}), Reply(403, {}), Reply(403, {}))
+    server.reply(DELETE, Reply(200, {}))
+    server.reply(PLANS, EMPTY_PLANS)
+    await vk.list_campaigns(["55"])
+    clock.advance(86400)
+    with pytest.raises(AdApiError) as error:
+        await vk.suspend("55")
+    assert isinstance(error.value, AuthError) and error.value.code == "token_limit"
+
+
 @pytest.mark.parametrize(("code", "then"), [
     ("expired_token", "refresh_token"), ("invalid_token", "client_credentials"),
 ])
@@ -161,7 +191,7 @@ async def test_campaigns_are_read_with_their_daily_budgets(server: ScriptedServe
     server.reply(PLANS, Reply(body={"count": 4, "offset": 0, "items": [
         {"id": 11, "name": "Сайт", "status": "active", "budget_limit_day": "300.00", "budget_limit": "6000"},
         {"id": 12, "name": "Сайт 2", "status": "blocked", "budget_limit_day": None, "budget_limit": "5000"},
-        {"id": 13, "name": "Удалена", "status": "deleted", "budget_limit_day": "0"},
+        {"id": 13, "name": "Удалена", "status": "deleted", "budget_limit_day": "0", "budget_limit": "0"},
         {"id": 14, "name": "Странная", "status": "active", "budget_limit_day": "NaN"},
     ]}))
 
@@ -170,8 +200,8 @@ async def test_campaigns_are_read_with_their_daily_budgets(server: ScriptedServe
     assert server.requests[1].query == {"_id__in": "11,12,13,14",
                                         "fields": "id,name,status,budget_limit_day,budget_limit", "limit": "50"}
     assert campaigns == [
-        CampaignInfo("11", "Сайт", CampaignState.ACTIVE, Budget(366_00, BudgetKind.DAY)),
-        CampaignInfo("12", "Сайт 2", CampaignState.PAUSED, None),
+        CampaignInfo("11", "Сайт", CampaignState.ACTIVE, Budget(366_00, BudgetKind.DAY), SpendLimit(7320_00)),
+        CampaignInfo("12", "Сайт 2", CampaignState.PAUSED, None, SpendLimit(6100_00)),  # a budget for the campaign
         CampaignInfo("13", "Удалена", CampaignState.OTHER, None),
         CampaignInfo("14", "Странная", CampaignState.ACTIVE, None),
     ]
@@ -224,6 +254,38 @@ async def test_rate_limit_headers_are_respected(server: ScriptedServer, vk: VkAd
     await vk.list_campaigns(["11"])
     with pytest.raises(RateLimited):
         await vk.list_campaigns(["11"])
+
+
+async def test_limits_are_per_method_and_never_hold_back_a_pause(server: ScriptedServer, vk: VkAdsClient,
+                                                                 clock: FakeClock) -> None:
+    """Review finding 4: the statistics' daily limit blocked every pause until Moscow midnight."""
+    server.reply(TOKEN, token_reply("access-1", expires_in=10 * 86400))
+    server.reply(STATS, Reply(body={"items": []}, headers={"X-RateLimit-Daily-Remaining": "0"}))
+    server.reply(MASS, Reply(204, headers={"X-RateLimit-Daily-Remaining": "0"}), Reply(204))
+    await vk.daily_spend(["55"], date(2026, 11, 20), date(2026, 11, 20))
+
+    await vk.suspend("55")  # the cap/season guard or /ads stop
+    await vk.suspend("55")  # even the method's own used-up day does not hold a change back
+
+    assert server.routes().count(MASS) == 2
+    with pytest.raises(RateLimited):
+        await vk.daily_spend(["55"], date(2026, 11, 20), date(2026, 11, 20))
+    assert server.routes().count(STATS) == 1, "reads of the used-up method wait for the next day"
+
+
+async def test_a_change_refused_as_too_many_is_sent_again(server: ScriptedServer, vk: VkAdsClient,
+                                                          clock: FakeClock) -> None:
+    too_many = Reply(429, {"error": {"code": "throttled"}})
+    server.reply(TOKEN, token_reply("access-1", expires_in=10 * 86400))
+    server.reply(MASS, too_many, too_many, Reply(204), too_many, too_many, too_many, too_many)
+    started = clock.monotonic()
+
+    await vk.suspend("55")
+
+    assert clock.monotonic() - started == 2 + 5 and server.routes().count(MASS) == 3
+    with pytest.raises(RateLimited):
+        await vk.suspend("55")
+    assert server.routes().count(MASS) == 7, "three more tries after the first, then the failure is reported"
 
 
 @pytest.mark.parametrize(("reply", "error"), [

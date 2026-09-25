@@ -1,4 +1,4 @@
-"""Periodic jobs (§10): one asyncio loop with a 30 s tick; each job keeps its own last-run guard.
+"""Periodic jobs (§10): asyncio loops with a 30 s tick; each job keeps its own last-run guard.
 
 Schedule (Moscow time, config TZ); the job bodies live in ``app.jobs``:
 
@@ -6,8 +6,9 @@ Schedule (Moscow time, config TZ); the job bodies live in ``app.jobs``:
 - 12:00 pre-exchange reminders; 00:10 ending games; 03:30 data retention;
   04:00 backup; 09:00 certificate expiry check; 21:00 the admins' digest;
 - every 10 minutes (webhook mode): the webhook watchdog;
-- with PROMO_ENABLED=1 (PROMO_SPEC §6, §8): the ad report at PROMO_REPORT_TIME (10:00),
-  the budget guard every 2 hours and the own-channel posts every 10 minutes.
+- with PROMO_ENABLED=1 (PROMO_SPEC §6, §8), in a loop of their own so a slow ad platform
+  never holds up the jobs above: the ad report at PROMO_REPORT_TIME (10:00), the budget
+  guard every 2 hours and the own-channel posts every 10 minutes.
 
 The outbox worker runs on its own (``Outbox.start``, started by ``app.main``).
 
@@ -89,7 +90,7 @@ class Job:
 
 
 def jobs_for(config: Config) -> list[Job]:
-    """The jobs this configuration needs: without a bot token only housekeeping runs."""
+    """The bot's jobs for this configuration: without a bot token only housekeeping runs."""
     schedule = [
         Job("end_games", DailyAt(time(0, 10)), jobs.end_games),
         Job("retention", DailyAt(time(3, 30)), jobs.purge_old_data),
@@ -105,13 +106,18 @@ def jobs_for(config: Config) -> list[Job]:
     ]
     if config.mode == "webhook":
         schedule.append(Job("webhook_watchdog", Every(600), jobs.webhook_watchdog))
-    if config.promo.enabled:
-        schedule += [
-            Job("promo_daily", DailyAt(config.promo.report_time), autopilot.daily_job),
-            Job("promo_guard", Every(autopilot.GUARD_INTERVAL), autopilot.guard_job),
-            Job("promo_channel", Every(CHANNEL_INTERVAL), channel.post_due),
-        ]
     return schedule
+
+
+def promo_jobs_for(config: Config) -> list[Job]:
+    """The ad autopilot's jobs (PROMO_ENABLED=1 and a bot token), run by a scheduler of their own."""
+    if not (config.bot_enabled and config.promo.enabled):
+        return []
+    return [
+        Job("promo_daily", DailyAt(config.promo.report_time), autopilot.daily_job),
+        Job("promo_guard", Every(autopilot.GUARD_INTERVAL), autopilot.guard_job),
+        Job("promo_channel", Every(CHANNEL_INTERVAL), channel.post_due),
+    ]
 
 
 class Scheduler:
@@ -148,18 +154,20 @@ class Scheduler:
             await asyncio.sleep(TICK_SECONDS)
 
 
-_TASK_KEY = web.AppKey("scheduler_task", asyncio.Task)
+_TASKS_KEY = web.AppKey("scheduler_tasks", list)
 
 
 async def start(app: web.Application) -> None:
     ctx = app[CTX_KEY]
-    scheduler = Scheduler(ctx, jobs_for(ctx.config))
-    app[_TASK_KEY] = asyncio.create_task(scheduler.run_forever(), name="scheduler")
+    tasks = [asyncio.create_task(Scheduler(ctx, jobs_for(ctx.config)).run_forever(), name="scheduler")]
+    promo = promo_jobs_for(ctx.config)
+    if promo:
+        tasks.append(asyncio.create_task(Scheduler(ctx, promo).run_forever(), name="promo_scheduler"))
+    app[_TASKS_KEY] = tasks
 
 
 async def stop(app: web.Application) -> None:
-    task = app.get(_TASK_KEY)
-    if task is not None:
+    for task in app.get(_TASKS_KEY, []):
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task

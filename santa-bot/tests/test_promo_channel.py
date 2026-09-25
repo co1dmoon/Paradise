@@ -105,12 +105,19 @@ async def test_nothing_is_posted_while_off_or_without_a_channel(ctx: AppContext,
     assert await store.post_statuses(ctx.db) == {}
 
 
-async def test_a_refused_post_alerts_the_admins(ctx: AppContext, api: FakeMaxApi, clock: FakeClock,
-                                                channel_on: None) -> None:
+async def test_a_refused_post_alerts_the_admins_and_may_be_sent_again(ctx: AppContext, api: FakeMaxApi,
+                                                                       clock: FakeClock, channel_on: None) -> None:
     api.fail_next(Forbidden(403, "chat.denied"))
     travel(clock, msk(5, 12, 1))
     await channel.post_due(ctx)
     await ctx.outbox.drain()
     assert api.messages_in_chat(CHANNEL) == []
-    assert api.texts_to(ADMIN_ID) == [texts.promo_post_failed("chat.denied")]
-    assert await store.post_statuses(ctx.db) == {"ch01": PostStatus.SENT}, "it is not posted twice by the job"
+    alert = texts.promo_post_failed(error="chat.denied", post_id="ch01")
+    assert api.texts_to(ADMIN_ID) == [alert] and alert.endswith("Отправить снова: /channel send ch01.")
+    assert await store.post_statuses(ctx.db) == {"ch01": PostStatus.FAILED}
+    await channel.post_due(ctx)
+    assert await posted(ctx, api) == [], "the job does not repeat it on its own"
+
+    assert await channel.publish(ctx, CHANNEL, content.CALENDAR[0]), "finding 13: an admin may send it again"
+    assert await posted(ctx, api) == [content.CALENDAR[0].text]
+    assert await store.post_statuses(ctx.db) == {"ch01": PostStatus.SENT}

@@ -303,9 +303,10 @@ README_RU.md: add a short section pointing to docs/PROMO_KIT_RU.md and listing t
 
 ## Implementation notes
 
-Written with the implementation on 2026-09-25. The code is in `app/promo/`, the owner's kit in
-`docs/PROMO_KIT_RU.md`, the tests in `tests/test_promo_*.py` (offline: aiohttp test servers stand in for both APIs,
-`tools/fake_ads.py` for the orchestration tests).
+Written with the implementation on 2026-09-25 and revised the same day after an independent review (14 findings,
+all fixed; see the last list). The code is in `app/promo/`, the owner's kit in `docs/PROMO_KIT_RU.md`, the tests in
+`tests/test_promo_*.py` (offline: aiohttp test servers stand in for both APIs, `tools/fake_ads.py` for the
+orchestration tests).
 
 ### Checked on the official pages
 
@@ -314,12 +315,19 @@ Yandex Direct (yandex.com/dev/direct, yandex.ru/support/direct, yandex.ru/dev/id
   `Accept-Language: ru`; the `Units` response header reads spent/left/limit (logged at debug level).
 - `campaigns.get`: `FieldNames` [Id, Name, Type, State, Status] plus `UnifiedCampaignFieldNames` [BiddingStrategy].
   State ON → active, SUSPENDED → paused, anything else → other.
-- The budget of a unified campaign: `UnifiedCampaign.BiddingStrategy.{Search|Network}.<Structure>.WeeklySpendLimit`
-  (micros, net of VAT) in WbMaximumClicks, WbMaximumConversionRate, AverageCpc, AverageCpa and PayForConversion.
-  `campaigns.update` requires `BiddingStrategyType` in the strategy part it sends, and "values of omitted parameters
-  don't change" (best-practice/part-update), so an update sends the current type and the new `WeeklySpendLimit` only.
-- `campaigns.suspend` / `resume`: the per-object warnings 10020 "already suspended" and 10021 "not suspended" count
-  as success.
+- A unified campaign's strategy has a `Search` and a `Network` part; the budget sits in the part's structure
+  (WbMaximumClicks, WbMaximumConversionRate, AverageCpc, AverageCpa, AverageCrr, PayForConversion,
+  PayForConversionCrr): `WeeklySpendLimit` (micros, net of VAT) or `CustomPeriodBudget {SpendLimit, StartDate,
+  EndDate, AutoContinue}` — "When creating a campaign, you can't specify both". `campaigns.update` requires
+  `BiddingStrategyType` in the part it sends, and "values of omitted parameters don't change"
+  (best-practice/part-update).
+- `campaigns.suspend` / `resume`: warnings 10020 "already suspended" and 10021 "not suspended"; other warnings
+  include 10163 «Настройка не будет изменена» and 10165 «Параметр не будет применен» (errors-list).
+- The weekly budget (support/direct/ru/strategies/week-budget): with 3+ days of impressions a day may take up to
+  35% of the week plus what was carried over from last week; pay-per-click strategies carry over at most 30% of
+  the budget; a change of the weekly budget restarts the week, and on that day «35% от старого бюджета + 35% от
+  нового» (pay per click) or «100% старого + 100% нового бюджета, если все конверсии будут получены в один день»
+  (pay per conversion) may be spent.
 - Reports: CAMPAIGN_PERFORMANCE_REPORT with Date/CampaignId/Clicks/Cost, `IncludeVAT: YES`, TSV and the headers of
   §3.1; HTTP 201/202 with `retryIn`; offline reports are kept for 5 hours under their name.
 - Error codes (errors-list): 53, 54, 58, 513, 3000 → `AuthError`; 152, 506 → `RateLimited`; 52, 1000, 1001, 1002
@@ -337,46 +345,55 @@ VK Ads (ads.vk.ru/doc/api, ads.vk.ru/help):
 - API errors 401 `{"code", "message"}`: `invalid_token` (issue a new token), `expired_token` (refresh),
   `invalid_client`, `invalid_user`, `revoked_token`.
 - `GET v2/ad_plans.json?_id__in=…&fields=id,name,status,budget_limit_day,budget_limit&limit=50` → `{count, offset,
-  items}`; status active/blocked/deleted; budgets are decimals net of VAT.
+  items}`; status active/blocked/deleted; `budget_limit_day` (daily) and `budget_limit` (the whole campaign) are
+  decimals net of VAT.
 - `POST v2/ad_plans/mass_action.json`, a JSON array of up to 200 changes → 204.
 - `GET v2/statistics/ad_plans/day.json?id=…&date_from=…&date_to=…&metrics=base` → `items[{id, rows[{date, base{clicks,
-  spent}}]}]`, up to 200 ids; `spent` is net of VAT.
-- `X-RateLimit-RPS-Remaining`, `-Hourly-Remaining`, `-Daily-Remaining`; 429 means too many requests.
+  spent}}]}]`, up to 200 ids; `spent` is net of VAT; an unknown or unavailable id fails the request with 400
+  `ERR_WRONG_ADPLANS`.
+- Limits are counted per method («для различных методов будут различные значения») and per calendar second, hour
+  and day, in `X-RateLimit-RPS-Remaining`, `-Hourly-Remaining`, `-Daily-Remaining`; 429 means too many requests.
 - URL macros (help/features/utm): `{{ad_plan_id}}` is the campaign and `{{campaign_id}}` the ad group; the group's
   «Параметры URL» take priority over the ad's link and by default add VK's own UTM tags (`utm_source=vk_ads`).
-- Universal ads (help/features/formats): title ≤ 40, short text ≤ 90 characters.
+- Universal ads (help/features/formats): title ≤ 40, short text ≤ 90 characters, no emoji in the text, images
+  1:1/4:5/16:9 up to 5 MB, text on an image ≤ 20%.
 
 ### Not verified, and what the code does about it
 
-No failure below crashes a job or moves money: a failed read leaves the stored numbers and says so in the report,
-a failed change is stored as `failed` and the admins get the manual steps. Mutating calls are never retried.
+No failure below crashes a job or moves money: a failed read leaves the stored numbers, says so in the report and,
+from the guard, alerts the admins (at most every 6 hours per platform); a failed change is stored as `failed` and
+the admins get the manual steps. Mutating calls are never retried, except a VK change refused with 429 (see
+deviations). **Before `/ads auto on` the kit (section 4.6) makes the owner run both budget writes once on
+stopped campaigns with the minimum budget and compare the result in each web interface.**
 
 1. **Direct sandbox at v501.** The documented sandbox is `…/json/v5/`. With YANDEX_DIRECT_SANDBOX=1 the client calls
    `https://api-sandbox.direct.yandex.com/json/v501/`, never switches versions, and a failure shows in the report
    with a note that the sandbox may not serve v501.
 2. **The `campaigns.update` body** follows the docs but was never sent to the real API; nor is it stated whether
-   `WeeklySpendLimit` may carry kopecks (the client sends the net amount floored to the kopeck, in micros). If Direct
-   refuses, the change is `failed` and the admin gets «Директ → кампания → Редактировать → Стратегия → Недельный
-   бюджет N ₽» with the net amount.
-3. **Weekly vs period budget.** The docs do not say which limit applies when a strategy returns both
-   `WeeklySpendLimit` and a `CustomPeriodBudget` (or `BudgetType: CUSTOM_PERIOD_BUDGET`). Such a campaign counts as
-   having no weekly budget: no raises, `/ads budget` refuses with an explanation, and the cap uses the rule for an
-   unknown budget. The kit tells the owner to use a weekly budget.
-4. **VK `budget_limit_day` as a string with kopecks** (`"385.24"`): if VK refuses it, same as 2 with «VK Реклама →
+   `WeeklySpendLimit` may carry kopecks (the client sends the net amount floored to the kopeck, in micros). The
+   client fails on any warning of the update and reads the budget back: if it did not change, the change is
+   `failed` (`not_applied`) and the admin gets «Директ → кампания → Редактировать → Стратегия → Недельный бюджет
+   N ₽». That the read-back sees the new value at once (the update being synchronous) is assumed.
+3. **VK `budget_limit_day` as a string with kopecks** (`"385.24"`): if VK refuses it, same as 2 with «VK Реклама →
    кампания → Бюджет».
+4. **Which Direct parts carry a budget.** `SERVING_OFF` and `NETWORK_DEFAULT` parts are taken to carry none (the
+   latter as "the search settings"); budgets in both parts, a part with a strategy the client does not know
+   (e.g. HIGHEST_POSITION) or without a budget it can read, and a budget for a period without readable dates leave
+   the budget blind — the campaign is then paused on its own (deviation 3).
 5. **Error bodies of the VK token endpoint** are not documented (only those of API calls are). The client reads the
    OAuth form `{"error": "invalid_client"}` and the VK forms `{"error": {"code"}}` / `{"code"}`; anything else
-   becomes an `AuthError` with a generic "check the keys" alert.
+   becomes an `AuthError` with a generic "check the keys" alert. A 403 on a refresh is treated like the token
+   limit (a new token is requested).
 6. **Whether `token/delete.json` frees the limit.** On a 403 the client deletes the tokens once and asks once more;
    if VK still refuses, the admins get the `token_limit` alert (with the support address). There is no loop.
 7. **Direct's invalid-token code.** The error list says 53, the token page says 1002. A 1002 whose text mentions the
    token is an `AuthError` (the "get a new token" alert); any other 1002 is a server error.
-8. **Day boundaries of the reports.** Direct reports by the account's time zone, VK presumably by Moscow days. Spend
-   is stored by the platforms' days; another zone could move spend between neighbouring days, never change totals.
-9. **Whether Reports calls cost API points** is not stated; irrelevant at one small report per run.
+8. **Day boundaries.** Direct reports by the account's time zone, VK presumably by Moscow days, and VK's daily
+   request limits are taken to reset at Moscow midnight. Spend is stored by the platforms' days; another zone could
+   move spend between neighbouring days, never change totals.
+9. **Whether Reports calls cost API points** is not stated; irrelevant at a few small reports a day.
 10. **The MAX channel id** is accepted as any signed integer; the bot also sends the admins the id when it is added
-    to a channel (bot_added, the P1 item of §9.5 is done). A post MAX refuses reaches the admins through the outbox
-    delivery hook (at most every 5 minutes).
+    to a channel (bot_added, the P1 item of §9.5 is done).
 11. Not needed by this implementation: VK objective and package codes (campaigns are created in the web interfaces,
     §12), a MAX bot link as an ad destination (ads lead to the landing page, which passes `src` into `s_<src>`), the
     real lead time of VK API access (the kit asks the owner to apply by 10 November).
@@ -384,45 +401,94 @@ a failed change is stored as `failed` and the admins get the manual steps. Mutat
 ### Deviations from this spec, and additions
 
 1. Money in the protocol is integer kopecks: `set_budget(id, gross_kop, kind)`. Rubles appear only in commands and
-   texts; `/ads budget` and `/ads cap` take whole gross rubles.
-2. Schema additions: `promo_campaigns.plan_budget_kind` (to read the plan budget), `promo_posts_sent.status`
-   ('sent' | 'skipped'), the table `promo_channels` (channels the bot was added to, P1) and an index on
-   `users(first_source)`. `promo_actions.src` is `'*'` for suspend_all. `promo_posts_sent.mid` stays empty: the outbox
-   does not hand back message ids.
-3. Attribution: `users` counts the `user_first_seen` events of a source, so people removed by the 7-day retention of
-   unconsented users still count. `games3` = drawn games (`drawn_at` survives later departures) or games with 3+
-   active participants now; the participants table keeps no history, so a game that had 3 and lost people before a
-   draw is not counted (the error is on the cautious side).
-4. Rule 2 uses `ceil(week / 7)` for a weekly budget as written, although Direct may spend up to 35% of it in one day;
-   the 35% share is used only for a Direct campaign whose current budget is unknown and whose plan budget was weekly.
-   With nothing known it assumes `max(cap − spent, 1 kopeck)`.
-5. Rule 4 floors the target to 10 ₽ (never above +max_raise_pct or the cap room), lifts it to the platform minimum
-   (366 ₽ gross at 22% VAT) only when the cap room allows, skips raises under 50 ₽, and several cheap campaigns
-   share the cap room in turn.
+   texts; `/ads budget` and `/ads cap` take whole gross rubles. A budget the bot sets is stored as the platform will
+   report it (gross of the net amount floored to the kopeck), so a later read does not look like a cabinet change.
+2. Schema (`003_promo.sql`, edited in place because it was never released): `plan_budget_*` was dropped (nothing
+   reads it once blind budgets are paused, deviation 3); added `previous_budget_kop`, `limit_kop/_start/_end`,
+   `pays_per_conversion`, `changed_at`, `spend_checked_at`, `paused_by = 'preseason'`, `promo_posts_sent.status`
+   ('sent' | 'skipped' | 'failed') and `.outbox_id`, the table `promo_channels` (P1) and an index on
+   `users(first_source)`. `promo_actions.src` is `'*'` for suspend_all; `promo_posts_sent.mid` stays empty (the
+   outbox does not hand back message ids).
+3. **Budgets (rule 2 of §5 replaced).** One more day of a campaign is the smallest visible bound: VK's daily budget;
+   Direct's weekly budget at 45.5% of the week when paying per click (35% of the week plus up to 30% carried
+   over) and 100% when paying per conversion, with the replaced budget(s) added on the day of a change (also a
+   change noticed in the cabinet); what is left of VK's budget for the whole campaign or of Direct's budget for a
+   period (the whole period budget when today is outside its dates). A campaign with none of these is **blind**:
+   it is paused on its own (reason «не вижу бюджета…», `paused_by='autopilot'`) and left out of the others'
+   projection, `/ads add` warns about it loudly and `/ads resume` refuses it. The cap check itself is unchanged.
+4. Rule 4 (raises) floors the target to 10 ₽ (never above +max_raise_pct or the room under the cap — for a
+   weekly budget counting the old and the new week on the change day), lifts it to the platform minimum (366 ₽
+   gross at 22% VAT) only when the room allows, skips raises under 50 ₽ and needs numbers fetched within 4
+   hours; several cheap campaigns share the room in turn. The raise message for Direct says that the week
+   restarts and what the change day may cost.
+5. **The season window** pauses before the season as `preseason` and after it as `season`. Campaigns paused
+   `preseason` are started again by the first daily run inside the season (autopilot mode, a report line
+   «Сделал: … — запуск: сезон начался»), each only with fresh numbers, a visible budget and room under the cap —
+   otherwise they stay paused for the cap or the blind budget. In test mode the line says which `/ads resume` to
+   run. This is the one start the autopilot makes without an admin.
 6. An admin's pause is sticky: after `/ads stop` a campaign keeps `paused_by='admin'` even if the owner starts it in
-   the cabinet, and rules 3–4 leave it alone until `/ads resume` (rules 1–2 still apply).
-7. Proposals: in autopilot mode each raise comes as its own message right after the report, with [Поднять до X ₽]
+   the cabinet, and rules 5–6 leave it alone until `/ads resume` (season, blind budgets and the cap still apply).
+7. Proposals: in autopilot mode each raise comes as its own message after the report, with [Поднять до X ₽]
    [Не надо]; the answer replaces that message. In test mode the report line reads «Предложил бы: …» (pauses:
-   «Сделал бы: …») without buttons. Open proposals expire after 24 hours, also swept by the daily job. `/ads` adds
-   the payback (ROAS) and the games that participants of the source's games organized later (`downstream_games`).
-8. promo_guard acts only in autopilot mode (in test mode the daily report says what it would do) and also refreshes
-   the campaigns' states and budgets, which rules 1–2 need.
-9. A budget set by `/ads budget` is checked against the cap only for a running campaign; a paused one is checked by
-   `/ads resume`.
-10. The Direct report name also carries the fetch time: offline reports are kept for 5 hours under their name, and
-    a repeated name would return stale numbers.
-11. The promo commands, buttons and the channel-id notice need PROMO_ENABLED=1 (otherwise one line explains how to
+   «Сделал бы: …») without buttons. Open proposals expire after 24 hours and when the autopilot is switched off;
+   a tap in test mode or after `/ads auto off` is refused. `/ads` adds the payback (ROAS), the games that
+   participants of the source's games organized later (`downstream_games`), a budget for the whole campaign and
+   how old the numbers are when they are older than 4 hours.
+8. **Fresh numbers.** Fetches run outside the promo lock; what they bring is stored under it, together with the
+   decisions, and a campaign the bot changed after a fetch began keeps the newer values (`changed_at`). A tap,
+   `/ads resume` and `/ads budget` fetch their campaign and today's spend again first and refuse (keeping the
+   buttons) when that fails. Spend requests ask only for campaigns the platform listed, and a refused request
+   (VK's ERR_WRONG_ADPLANS) is repeated one campaign at a time, so one bad id hides nobody else's spend.
+9. promo_guard acts only in autopilot mode and applies rules 1–3 (season, blind budgets, cap). It also refreshes
+   the campaigns' states and budgets, and alerts the admins (at most every 6 hours per platform) when it cannot
+   fetch fresh numbers. A failed automatic pause is reported as «СРОЧНО: не удалось остановить …».
+10. `/ads budget` is gross; its usage text says «Директ — за неделю, VK — за день»; a new budget more than 30% above
+    the current one, one whose day may cost over 500 ₽ more, or one set where none was visible waits for a tap
+    ([Да, X ₽ в неделю/день] [Не надо]) and is re-checked like a raise when tapped. The cap is checked only for a
+    running campaign (a paused one is checked by `/ads resume`).
+11. `/ads remove` says that further spend is neither counted nor stopped at the season's end and, while the
+    campaign may be running, offers [Остановить на площадке]. `/ads stop` stops «все подключённые кампании».
+12. The Direct report name also carries the fetch time: offline reports are kept for 5 hours under their name, and
+    a repeated name would return stale numbers. The whole wait for a report, requests included, is bounded by
+    5 minutes.
+13. The promo jobs run in a scheduler task of their own, so a slow platform never delays the bot's jobs.
+14. VK limits are tracked per method: a read waits for its own method's hour or day; changes (pauses above all) are
+    never held back, and one refused with 429 is sent again after 2, 5 and 10 s. Direct changes fail on any
+    warning other than "already in that state" for suspend/resume.
+15. The promo commands, buttons and the channel-id notice need PROMO_ENABLED=1 (otherwise one line explains how to
     switch it on). Settings are seeded on the first start with PROMO_ENABLED=1; `promo_auto` and `promo_channel_on`
-    always start at 0.
-12. The landing page now prefers `src` over `utm_source`, because VK adds `utm_source=vk_ads` to every link by
-    default.
-13. One lock (`locks.promo`) serializes the autopilot's decisions with the admins' ad commands and taps; the network
-    refresh runs outside it.
-14. Channel posts use this year's dates, and `promo_posts_sent` is keyed by post id: v1 covers one season (next
-    season needs new ids or a cleared table). The admins' credential alerts are throttled in memory, so a restart may
-    repeat one.
-15. The scheduler runs jobs one after another: a Direct offline report can hold the daily job for up to 5 minutes,
-    delaying the minute jobs that one time.
-16. The kit has 10 titles and 5 texts for Direct, split into two combinatorial ads (one takes at most 7 and 3).
-17. `/ads rules` takes an optional fifth value, the delay in days (0–14): `promo_lag_days` is seeded once like the
-    thresholds, so without it the delay could never change after the first start.
+    always start at 0. `/ads rules` takes an optional fifth value, the delay in days (0–14), because
+    `promo_lag_days` is seeded once like the thresholds.
+16. The landing page prefers `src` over `utm_source`, because VK adds `utm_source=vk_ads` to every link by default.
+17. Channel posts use this year's dates, and `promo_posts_sent` is keyed by post id: v1 covers one season. A post MAX
+    refuses is marked failed and `/channel send` sends it again. `/channel` and `/channel on` warn while the ad
+    label is empty: the button under every post leads to a paid service, so the kit now recommends an erid.
+18. One refusal or unexpected error of one campaign never stops the pauses of the others (errors are caught per
+    platform and per campaign); VK's token-limit error is an `AdApiError`. The admins' alerts are throttled in
+    memory, so a restart may repeat one.
+19. The kit has 10 titles and 5 texts for Direct, split into two combinatorial ads (one takes at most 7 and 3).
+
+### The review's findings (2026-09-25) and their fixes
+
+1. Unknown budgets broke the cap → blind campaigns are paused alone; limits for the whole campaign or a period
+   are used as bounds (deviation 3).
+2. Direct weekly budgets were projected as 1/7 a day → 45.5% / 100% and both budgets on the change day; the raise
+   message and the kit explain the restart (deviations 3–4).
+3. The guard ran blind on stale spend → alerts, per-campaign fallback for refused spend requests, fresh numbers
+   for raises, starts and admin changes (deviations 8–9).
+4. One VK method's daily limit blocked every pause → limits per method, changes never held back and retried on 429
+   (deviation 14).
+5. Campaigns paused before the season stayed paused → `preseason` pauses start again at the season's start
+   (deviation 5).
+6. Overstated texts → `/ads remove`, `/ads stop` and the kit's VK «Каналы» campaign (end date, a budget for the
+   whole campaign, not registered, the cap lowered by its budget) (deviation 11).
+7. Unmarked channel posts → the kit recommends an erid from Yandex's ORD; `/channel` warns (deviation 17).
+8. A 403 on the VK refresh escaped as a plain exception → an `AdApiError`, errors caught per platform and campaign
+   (deviation 18).
+9. Refreshes could overwrite admin changes → stored under the lock, newer changes kept (deviation 8).
+10. A raise could be approved after `/ads auto off` → proposals voided, taps refused (deviation 7).
+11. Unknown Direct update warnings passed as success → they fail, and the budget is read back (item 2 above).
+12. `/ads budget` weekly vs daily confusion → usage text and confirmation (deviation 10).
+13. A refused channel post could never be re-sent → marked failed, `/channel send` retries (deviation 17).
+14. The report wait counted only sleeps and the promo jobs blocked the bot's jobs → a bounded total wait and a
+    scheduler task of their own (deviations 12–13).

@@ -116,6 +116,7 @@ class Action(StrEnum):
     ADMIN_RESET_TITLE = "art"
     PROMO_APPROVE = "pa"
     PROMO_DECLINE = "pd"
+    PROMO_STOP_REMOVED = "px"
 
 
 def button(text: str, action: Action, *args: str | int) -> kb.CallbackButton:
@@ -731,3 +732,15 @@ def promo_proposal(action_id: int, text: str, to_kop: int) -> OutMessage:
     """[Поднять до X ₽] [Не надо]; the handlers re-check everything in the database."""
     return OutMessage(text, kb.keyboard([button(texts.btn_promo_raise(to_kop), Action.PROMO_APPROVE, action_id),
                                          button(texts.BTN_PROMO_DECLINE, Action.PROMO_DECLINE, action_id)]))
+
+
+def promo_budget_confirm(action_id: int, text: str, to_kop: int, kind: str) -> OutMessage:
+    """A large /ads budget change waits for [Да, X ₽ в неделю] [Не надо] (the same checks as a raise)."""
+    confirm = texts.btn_promo_budget_confirm(to_kop=to_kop, kind=kind)
+    return OutMessage(text, kb.keyboard([button(confirm, Action.PROMO_APPROVE, action_id),
+                                         button(texts.BTN_PROMO_DECLINE, Action.PROMO_DECLINE, action_id)]))
+
+
+def promo_removed(src: str, text: str) -> OutMessage:
+    """/ads remove of a campaign that may still run: [Остановить на площадке]."""
+    return OutMessage(text, kb.keyboard(button(texts.BTN_PROMO_STOP_REMOVED, Action.PROMO_STOP_REMOVED, src)))

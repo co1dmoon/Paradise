@@ -5,8 +5,9 @@ The bot must be an admin of the channel («Администратором кан
 ``chat_id``, rate-limited and retried — and each calendar post is recorded in
 ``promo_posts_sent`` in the same transaction as its outbox row, so it goes out once. A post
 more than 24 hours overdue is skipped and recorded as such: stale advice looks odd in a
-channel. The admins hear about a post MAX refused through the outbox hooks
-(``app.delivery``); the outbox does not hand back message ids, so ``mid`` stays empty.
+channel. A post MAX refused is marked failed by the outbox hooks (``app.delivery``), which
+tell the admins; /channel send tries a skipped or failed post again. The outbox does not
+hand back message ids, so ``mid`` stays empty.
 
 When the bot is added to a channel (bot_added with is_channel), the admins get its id for
 PROMO_MAX_CHANNEL_ID, and /channel lists such channels (P1).
@@ -21,7 +22,6 @@ from zoneinfo import ZoneInfo
 from app.config import Config
 from app.context import AppContext
 from app.core import kb, texts
-from app.core.dates import format_date
 from app.core.payloads import deep_link, source_payload
 from app.max_api import BotAdded, OutMessage, Target
 from app.outbox import PURPOSE_PROMO_POST
@@ -48,11 +48,6 @@ def due_at(post: Post, year: int, tz: ZoneInfo) -> datetime:
     return datetime(year, month, day, hour, minute, tzinfo=tz)
 
 
-def when_text(moment: datetime, tz: ZoneInfo) -> str:
-    local = moment.astimezone(tz)
-    return f"{format_date(local.date())}, {local:%H:%M}"
-
-
 async def post_due(ctx: AppContext) -> None:
     """The promo_channel job (every 10 minutes): post what is due, skip what is a day overdue."""
     channel_id = ctx.config.promo.channel_id
@@ -72,19 +67,21 @@ async def post_due(ctx: AppContext) -> None:
 
 
 async def publish(ctx: AppContext, channel_id: int, post: Post) -> bool:
-    """Queue ``post`` for the channel unless it was sent already (a skipped post may be sent)."""
+    """Queue ``post`` for the channel unless it went out already (a skipped or failed post may go again)."""
     now = ctx.clock.now()
     async with ctx.db.transaction() as tx:
         fresh = await store.mark_post(tx, post.id, PostStatus.SENT, now)
-        if not fresh and not await store.resend_skipped_post(tx, post.id, now):
+        if not fresh and not await store.resend_post(tx, post.id, now):
             return False
-        await ctx.outbox.enqueue(Target.chat(channel_id), post_message(ctx.config, post),
-                                 dedupe_key=f"promo_post:{post.id}", purpose=PURPOSE_PROMO_POST, db=tx)
+        outbox_id = await ctx.outbox.enqueue(Target.chat(channel_id), post_message(ctx.config, post),
+                                             purpose=PURPOSE_PROMO_POST, db=tx)
+        assert outbox_id is not None  # no dedupe key: the row is always new
+        await store.set_post_outbox(tx, post.id, outbox_id)
     return True
 
 
 async def upcoming(ctx: AppContext, count: int) -> list[tuple[Post, datetime]]:
-    """The next posts that will go out (not sent, not skipped, not a day overdue)."""
+    """The next posts that will go out (not recorded yet, not a day overdue)."""
     now, tz = ctx.clock.now(), ctx.config.tz
     recorded = await store.post_statuses(ctx.db)
     pending = [(post, due_at(post, now.astimezone(tz).year, tz)) for post in content.CALENDAR

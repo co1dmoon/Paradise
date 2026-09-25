@@ -77,6 +77,12 @@ def format_date(value: date) -> str:
     return f"{value.day} {_MONTHS_GENITIVE[value.month - 1]}"
 
 
+def format_moment(moment: datetime, tz: ZoneInfo = MOSCOW) -> str:
+    """'25 ноября, 08:00' in ``tz``."""
+    local = moment.astimezone(tz)
+    return f"{format_date(local.date())}, {local:%H:%M}"
+
+
 def format_date_button(value: date) -> str:
     """'20.12, сб' — short form for buttons."""
     return f"{value:%d.%m}, {_WEEKDAYS_SHORT[value.weekday()]}"
