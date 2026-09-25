@@ -62,6 +62,7 @@ class SentMessage:
     disable_link_preview: bool
     at: float
     edits: list[OutMessage] = field(default_factory=list)
+    touched: int = 0  # order of the last send or edit, across all messages
 
     @property
     def current(self) -> OutMessage:
@@ -111,6 +112,7 @@ class FakeMaxApi:
         self._by_mid: dict[str, SentMessage] = {}
         self._callback_targets: dict[str, Target] = {}
         self._callback_mids: dict[str, str] = {}
+        self._touches = itertools.count(1)
 
     # --- failure injection -------------------------------------------------------------------
 
@@ -135,7 +137,7 @@ class FakeMaxApi:
         if target.kind == "user" and target.id in self._blocked_users:
             raise Forbidden(403, "chat.denied: user blocked the bot")
         mid = f"mid.{_next_id():06d}"
-        record = SentMessage(mid, target, message, disable_link_preview, self._now())
+        record = SentMessage(mid, target, message, disable_link_preview, self._now(), touched=next(self._touches))
         self.sent.append(record)
         self._by_mid[mid] = record
         self.calls.append(RecordedCall("send", target.key, record.at))
@@ -147,6 +149,7 @@ class FakeMaxApi:
         if record is None:
             raise Forbidden(404, "message.not.found")
         record.edits.append(message)
+        record.touched = next(self._touches)
         self.calls.append(RecordedCall("edit", record.target.key, self._now()))
 
     async def answer(
@@ -159,6 +162,7 @@ class FakeMaxApi:
         mid = self._callback_mids.get(callback_id)
         if message is not None and mid in self._by_mid:
             self._by_mid[mid].edits.append(message)
+            self._by_mid[mid].touched = next(self._touches)
         return notification is None or shown
 
     async def get_chat(self, chat_id: int) -> ChatInfo:
@@ -201,6 +205,13 @@ class FakeMaxApi:
     def last_text(self, user_id: int) -> str:
         return self.last_to(user_id).text
 
+    def screen(self, user_id: int) -> SentMessage:
+        """The message the user saw change last: newly sent, or replaced by an edit or answer."""
+        messages = self.messages_to(user_id)
+        if not messages:
+            raise AssertionError(f"nothing was sent to user {user_id}")
+        return max(messages, key=lambda message: message.touched)
+
     def buttons(self, user_id: int) -> list[Button]:
         """Buttons of the newest message to the user that has a keyboard."""
         for message in reversed(self.messages_to(user_id)):
@@ -231,7 +242,14 @@ class FakeMaxApi:
         message, button = self.find_button(user_id, text)
         if not isinstance(button, CallbackButton):
             raise AssertionError(f"button {button.text!r} is a link, not a callback")
-        update = message_callback(user_id, button.payload, name=name, message_mid=message.mid)
+        return self._callback(user_id, button.payload, name, message)
+
+    def forge(self, user_id: int, payload: str, *, name: str = "Участник") -> dict[str, Any]:
+        """A callback with any payload, as if pressed on the user's latest screen (stale or tampered buttons)."""
+        return self._callback(user_id, payload, name, self.screen(user_id))
+
+    def _callback(self, user_id: int, payload: str, name: str, message: SentMessage) -> dict[str, Any]:
+        update = message_callback(user_id, payload, name=name, message_mid=message.mid)
         callback_id = update["callback"]["callback_id"]
         self._callback_targets[callback_id] = Target.user(user_id)
         self._callback_mids[callback_id] = message.mid
@@ -365,6 +383,11 @@ class FakeUser:
     @property
     def last_text(self) -> str:
         return self.api.last_text(self.user_id)
+
+    @property
+    def screen_text(self) -> str:
+        """Text of the message that changed last (a new message or a replaced screen)."""
+        return self.api.screen(self.user_id).text
 
     @property
     def texts(self) -> list[str]:

@@ -28,6 +28,10 @@ class RelayLimitReached(GameError):
     pass
 
 
+class AlreadyReported(GameError):
+    """The same person already complained about this message."""
+
+
 @dataclass(frozen=True, slots=True)
 class Route:
     """Who a relay goes to. ``sender``/``recipient`` carry display names for the texts."""
@@ -85,11 +89,13 @@ async def send_relay(db: Db, route: Route, text: str, now: datetime) -> Relay:
 
 
 async def report_relay(db: Db, relay_id: int, reporter_id: int, now: datetime) -> Report:
-    """[Пожаловаться]: only the recipient of a relay can report it."""
+    """[Пожаловаться]: only the recipient of a relay can report it, once."""
     async with db.transaction() as tx:
         relay = await repo.get_relay(tx, relay_id)
         if relay is None or relay.to_id != reporter_id:
             raise PermissionDenied(f"user {reporter_id} cannot report relay {relay_id}")
+        if await repo.report_exists(tx, relay_id, reporter_id):
+            raise AlreadyReported(relay_id)
         report = await repo.insert_report(
             tx, relay.id, relay.game_id, reporter_id, relay.from_id, relay.text, now
         )

@@ -92,6 +92,10 @@ BUTTON_OUTDATED = "Эта кнопка устарела. Откройте «Мо
 NOT_ALLOWED = "Это действие вам недоступно."
 MAINTENANCE = "Идут технические работы. Попробуйте через 15 минут."
 SOMETHING_WENT_WRONG = "Что-то пошло не так. Попробуйте ещё раз чуть позже."
+GAME_FINISHED = "Эта игра уже завершена."
+ALREADY_DRAWN_ACTION = "Жеребьёвка в этой игре уже проведена — это действие больше недоступно."
+NOT_DRAWN_YET = "Жеребьёвки ещё не было — пара появится после неё."
+NOT_IN_GAME = "Вы больше не участвуете в этой игре."
 
 
 def blocked(support_email: str) -> str:
@@ -158,6 +162,10 @@ GAME_CREATED = (
 BTN_MY_WISHES = "Мои пожелания"
 BTN_PANEL = "Пульт игры"
 DAILY_LIMIT = "Сегодня вы уже создали 20 игр — это максимум на день. Попробуйте завтра."
+GAME_CREATED_NOT_PARTICIPATING = (
+    "Готово! Перешлите приглашение выше в общий чат (нажмите на сообщение → «Переслать») "
+    "или скопируйте ссылку. Когда кто-то вступит — я напишу."
+)
 
 # --- §5.3 joining ------------------------------------------------------------------------------
 
@@ -191,6 +199,10 @@ def name_saved(name: str) -> str:
 
 
 ASK_WISHES = "Напишите, что хотели бы получить: 2–5 идей, можно ссылки на товары. Или нажмите «Удивите меня»."
+
+
+def current_wishes(wishes: str) -> str:
+    return f"Сейчас: {wishes}"
 BTN_SURPRISE_ME = "Удивите меня"
 SURPRISE_WISHES = "Удивите меня!"
 
@@ -211,6 +223,7 @@ def confirm_leave(title: str) -> str:
 
 
 BTN_CONFIRM_LEAVE = "Да, выйти"
+LEAVE_AFTER_DRAW = "После жеребьёвки выйти из игры нельзя — напишите организатору."
 
 
 def left_game(title: str) -> str:
@@ -276,6 +289,10 @@ def participant_removed(name: str) -> str:
     return f"{name} больше не в игре."
 
 
+PARTICIPANT_GONE = "Этого человека уже нет в игре."
+NOBODY_TO_REMOVE = "Убирать некого: кроме вас, в игре никого нет."
+
+
 def removed_notice(title: str) -> str:
     return f"Организатор убрал вас из игры {_q(title)}."
 
@@ -309,6 +326,7 @@ EXCLUSION_NOT_PARTICIPANT = "Этого человека уже нет в игр
 EXCLUSIONS_LIMIT = "Не больше 50 пар исключений."
 EXCLUSION_REMOVED = "Пара убрана."
 NEED_TWO_FOR_EXCLUSION = "Для исключений нужно хотя бы два участника."
+EXCLUSIONS_HINT = "Нажмите «Добавить пару», чтобы два человека не дарили друг другу."
 
 
 def wish_reminder(title: str) -> str:
@@ -345,6 +363,7 @@ def btn_reminder(enabled: bool) -> str:
 
 BTN_CANCEL_GAME = "Отменить игру"
 SETTINGS_SAVED = "Сохранил."
+PARTICIPATION_ONLY_BEFORE_DRAW = "Участие организатора можно менять только до жеребьёвки."
 
 
 def confirm_cancel_game(title: str) -> str:
@@ -356,6 +375,10 @@ BTN_CONFIRM_CANCEL_GAME = "Да, отменить игру"
 
 def game_cancelled(title: str) -> str:
     return f"Игра {_q(title)} отменена организатором."
+
+
+def game_cancelled_by_you(title: str) -> str:
+    return f"Игра {_q(title)} отменена. Участники получили уведомление."
 
 
 def join_notice(*, title: str, names: Sequence[str], active: int, limit: int) -> str:
@@ -452,6 +475,9 @@ def waiting_list(*, free_limit: int, limit: int, price: int) -> str:
         f"Мест нет: в бесплатной игре до {free_limit} участников. Я поставил вас в очередь и сообщил "
         f"организатору. Расширить игру до {limit} человек может любой участник — {price} ₽ один раз."
     )
+
+
+WAITING_LIST_FULL = "Мест нет: игра заполнена. Я поставил вас в очередь и сообщил организатору."
 
 
 def btn_pay(price: int) -> str:
@@ -558,6 +584,7 @@ RELAY_DAILY_LIMIT = "На сегодня хватит сообщений в эт
 ANON_CHAT_OFF = "Организатор выключил анонимные сообщения в этой игре."
 RELAY_NOT_AVAILABLE = "Сообщения доступны только после жеребьёвки."
 REPORT_SENT = "Спасибо, жалоба отправлена. Мы проверим."
+RELAY_EMPTY = "Напишите текст сообщения."
 
 
 def report_to_admin(*, report_id: int, code: str | None, reporter_id: int, reported_id: int, text: str) -> str:
@@ -575,6 +602,7 @@ REPORT_CLOSED = "Жалоба закрыта."
 # --- §5.8 my games and help -----------------------------------------------------------------------
 
 NO_GAMES = "У вас пока нет игр. Создайте свою или вступите по коду из приглашения."
+BTN_MY_PARTICIPATION = "Моё участие"
 MY_GAMES_HEADER = "Ваши игры:"
 STATUS_LABELS = {
     "collecting": "идёт набор",

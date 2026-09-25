@@ -490,6 +490,15 @@ async def get_report(db: Db, report_id: int) -> Report | None:
     return None if row is None else from_row(Report, row)
 
 
+async def report_exists(db: Db, relay_id: int, reporter_id: int) -> bool:
+    return (
+        await db.fetchval(
+            "SELECT 1 FROM reports WHERE relay_id = ? AND reporter_id = ?", (relay_id, reporter_id)
+        )
+        is not None
+    )
+
+
 async def resolve_report(db: Db, report_id: int) -> bool:
     result = await db.execute("UPDATE reports SET resolved = 1 WHERE id = ? AND resolved = 0", (report_id,))
     return result.rowcount == 1

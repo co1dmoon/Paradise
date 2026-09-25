@@ -744,3 +744,14 @@ Deliberate deviations and decisions made while building (foundation stage):
 - Config: extra optional variables `DATA_DIR` (default /data) and `PORT` (default 8080). Generated secrets are stored in `DATA_DIR/secrets.env` (mode 0600) and printed once; a value in .env wins. Owner fields (OWNER_*, SUPPORT_EMAIL) are required only when the bot or payments are enabled; otherwise they are warnings.
 - Leaving or being removed before the draw deletes that person's exclusions and moves the first waiting person into the game. A removed participant cannot rejoin the same game.
 - /stats periods are Moscow calendar days: today, the last 7 days including today, and the season since September 1.
+Bot flows stage (handlers):
+- Handlers live in `app/handlers/`: `router.py` (dispatch), `private.py` (bot_started, typed text, commands; registries `@command` and `@state_handler`), `callbacks.py` (buttons; registry `@on(prefix, admin_only=)`), plus `session.py` (reply/answer bookkeeping, refusal texts), `flows.py` (shared flows), `views.py` (message builders and the callback vocabulary `Action`) and `notices.py` (queued messages to other people, including `payment_applied` for the ResultURL and `draw_results`).
+- Callback payloads carry the game id (`pn:17`, `rmy:17:12345`), except `pay:{CODE}:{tier}` and `ref:{CODE}` as specified. Navigation screens (panel, lists, pickers, settings) replace the message whose button was pressed via the callback answer's `message`; results and prompts are new messages.
+- The creation wizard keeps its draft in `user_state.data`; step 1–3 use the kinds title, budget_custom and date_custom (typed text at the budget or date step is taken as a custom value), step 4 keeps date_custom and re-asks on typed text. Settings edits reuse these kinds with `game_id` set.
+- An explicit 'код XXXXXX' always joins, even during a pending input; a bare code joins only when no input is pending and the game exists. Before consent, a typed code of an existing game is kept as the resume payload `j_CODE`.
+- The organizer opening their own invite gets the panel instead of joining; the organizer leaves or rejoins only through the participation toggle in the settings. Leaving and removal after the draw are not offered (P1).
+- The 'already drawn' message's [Создать игру] button is the ref button, so such games count as referred (§6.3).
+- When nobody can pay for more places (top tier reached or payments disabled) the waiting message omits the price and the pay button.
+- A person can report the same anonymous message once; a repeated tap only repeats 'жалоба отправлена'.
+- Blocked users are refused relays and game creation only, as §5.7 says; they can still join games.
+- Unverified (Robokassa): a Receipt in a GET link. It is signed URL-encoded, as the fiscalization docs say, and URL-encoded once more as a query value.

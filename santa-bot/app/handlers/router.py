@@ -1,7 +1,12 @@
 """Routes typed updates to the private, callback, admin and group handlers.
 
 Seam: ``app.updates.process_update`` calls ``dispatch`` for every new update,
-already deduplicated and under the sender's per-user lock.
+already deduplicated, with bot senders dropped, under the sender's per-user lock.
+
+- Private messages and bot_started go to ``private``; buttons to ``callbacks``.
+- In group chats everything except bot_added is ignored (§5); group mode is P1.
+- ``admin`` is imported so that its commands and buttons
+  register themselves with ``private.command`` and ``callbacks.on``.
 """
 
 from __future__ import annotations
@@ -9,10 +14,23 @@ from __future__ import annotations
 import logging
 
 from app.context import AppContext
-from app.max_api import Update
+from app.handlers import admin, callbacks, private  # noqa: F401  (admin registers its commands and buttons)
+from app.max_api import BotAdded, BotRemoved, BotStarted, BotStopped, CallbackQuery, MessageCreated, Target, Update
 
 log = logging.getLogger(__name__)
 
+PRIVATE_CHAT = "dialog"
+
 
 async def dispatch(ctx: AppContext, update: Update) -> None:
-    log.info("update received; conversation handlers are not installed yet", extra={"kind": type(update).__name__})
+    match update:
+        case BotStarted():
+            await private.on_start(ctx, update)
+        case MessageCreated() if update.is_private:
+            await private.on_message(ctx, update)
+        case CallbackQuery() if update.chat_type in (None, PRIVATE_CHAT):
+            await callbacks.on_callback(ctx, update)
+        case CallbackQuery():
+            await ctx.outbox.answer(Target.user(update.user.user_id), update.callback_id)
+        case MessageCreated() | BotAdded() | BotRemoved() | BotStopped():
+            log.info("update ignored", extra={"kind": type(update).__name__})

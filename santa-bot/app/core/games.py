@@ -237,14 +237,10 @@ async def create_game(
     _require_text(draft.budget_text, MAX_BUDGET)
     async with db.transaction() as tx:
         user = await repo.get_user(tx, organizer_id)
-        if user is None or not user.has_consent:
-            raise PermissionDenied(f"user {organizer_id} has not consented")
-        if user.blocked:
-            raise UserBlocked(organizer_id)
-        day = today.isoformat()
-        if user.games_created_day == day and user.games_created_today >= DAILY_GAME_LIMIT:
-            raise DailyLimitReached(organizer_id)
-        await repo.bump_games_created(tx, organizer_id, day)
+        if user is None:
+            raise PermissionDenied(f"user {organizer_id} does not exist")
+        check_can_create(user, today)
+        await repo.bump_games_created(tx, organizer_id, today.isoformat())
         source = await _game_source(tx, user, draft.source_game_id)
         game_id = await repo.insert_game(
             tx,
@@ -270,6 +266,16 @@ async def create_game(
             )
         await record(tx, Event.GAME_CREATED, now, user_id=organizer_id, game_id=game_id, source=source)
         return await load_game(tx, game_id)
+
+
+def check_can_create(user: User, today: date) -> None:
+    """Raise when ``user`` may not create a game today: no consent, blocked, or 20 games already."""
+    if not user.has_consent:
+        raise PermissionDenied(f"user {user.user_id} has not consented")
+    if user.blocked:
+        raise UserBlocked(user.user_id)
+    if user.games_created_day == today.isoformat() and user.games_created_today >= DAILY_GAME_LIMIT:
+        raise DailyLimitReached(user.user_id)
 
 
 async def _unique_code(db: Db, rng: random.Random) -> str:
