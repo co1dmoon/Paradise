@@ -116,6 +116,7 @@ class FakeMaxApi:
         self.answers: list[RecordedAnswer] = []
         self.calls: list[RecordedCall] = []
         self.subscriptions: list[Subscription] = []
+        self.commands: list[tuple[str, str]] = []
         self.chats: dict[int, ChatInfo] = {}
         self.pending_updates: list[dict[str, Any]] = []
         self.poll_wait = 0.01
@@ -144,6 +145,9 @@ class FakeMaxApi:
 
     async def get_me(self) -> BotInfo:
         return self.bot
+
+    async def set_commands(self, commands: Sequence[tuple[str, str]]) -> None:
+        self.commands = list(commands)
 
     async def send(self, target: Target, message: OutMessage, disable_link_preview: bool = False) -> str | None:
         self._raise_injected()

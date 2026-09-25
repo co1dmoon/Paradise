@@ -26,6 +26,7 @@ async def test_app_starts_registers_webhook_and_stops(config: Config, clock: Fak
     ctx = server.app[CTX_KEY]
     assert ctx.runtime.webhook_registered and ctx.runtime.bot_username == fake_max.BOT_USERNAME
     assert [s.url for s in api.subscriptions] == [config.webhook_url]
+    assert [name for name, _ in api.commands] == ["start", "help", "cancel", "whoami"]
     assert (await ctx.settings()).free_limit == 10
     await server.close()
 

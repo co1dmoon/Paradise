@@ -194,3 +194,10 @@ async def test_subscriptions_and_updates(server: tuple[Recorder, HttpMaxApi]) ->
     page = await api.get_updates(None, 30)
     assert page.marker == 7 and len(page.updates) == 1
     assert recorder.requests[-1]["query"] == {"timeout": "30", "limit": "100"}
+
+
+async def test_command_menu(server: tuple[Recorder, HttpMaxApi]) -> None:
+    recorder, api = server
+    await api.set_commands([("start", "Главное меню")])
+    assert recorder.requests[-1]["route"] == "PATCH /me/commands"
+    assert recorder.requests[-1]["body"] == {"commands": [{"name": "start", "description": "Главное меню"}]}

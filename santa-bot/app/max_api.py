@@ -13,6 +13,8 @@ Checked against dev.max.ru on 2026-09-24:
 - POST /subscriptions {url, update_types, secret}; the secret must match
   ^[a-zA-Z0-9_-]{5,256}$. GET /subscriptions → {subscriptions: [{url, time, update_types}]}.
 - GET /updates?limit=1..1000&timeout=0..90&marker= → {updates: [...], marker}.
+- PATCH /me/commands {commands: [{name, description}]} (up to 32) sets the '/' menu
+  (checked 2026-09-25; whether ``name`` takes the leading '/' is not documented).
 - Button limits are not documented; ``app.core.kb`` enforces conservative ones.
 
 Responses are parsed leniently: unknown fields are ignored and unexpected shapes
@@ -197,6 +199,9 @@ class UpdatesPage:
 class MaxApi(Protocol):
     async def get_me(self) -> BotInfo: ...
 
+    async def set_commands(self, commands: Sequence[tuple[str, str]]) -> None:
+        """The command menu shown when a user types '/': (name without '/', description)."""
+
     async def send(self, target: Target, message: OutMessage, disable_link_preview: bool = False) -> str | None:
         """Send a message; returns its mid when MAX reports one."""
 
@@ -275,6 +280,10 @@ class HttpMaxApi:
     async def get_me(self) -> BotInfo:
         data = await self._request("GET", "/me")
         return BotInfo(_int(data.get("user_id")) or 0, _str(data.get("username")), _str(data.get("name")))
+
+    async def set_commands(self, commands: Sequence[tuple[str, str]]) -> None:
+        body = {"commands": [{"name": name, "description": description} for name, description in commands]}
+        await self._request("PATCH", "/me/commands", body=body)
 
     async def send(self, target: Target, message: OutMessage, disable_link_preview: bool = False) -> str | None:
         params: dict[str, Any] = dict(target.query())

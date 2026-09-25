@@ -84,6 +84,12 @@ def whoami(user_id: int) -> str:
     return f"Ваш id в MAX: {user_id}"
 
 
+COMMAND_MENU: tuple[tuple[str, str], ...] = (
+    ("start", "Главное меню"),
+    ("help", "Как это работает"),
+    ("cancel", "Отменить ввод"),
+    ("whoami", "Мой id в MAX"),
+)
 INPUT_CANCELLED = "Хорошо, отменил."
 NOTHING_TO_CANCEL = "Отменять нечего. Открыть меню — /start."
 UNKNOWN_INPUT = "Я понимаю кнопки и код игры из 6 символов. Открыть меню — /start."

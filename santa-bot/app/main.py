@@ -3,6 +3,7 @@
 Startup: config is validated before the app is built (fail fast), then
 1. open the database and apply migrations, seed settings from env (DB wins later);
 2. GET /me: log the bot name and warn the admins if it differs from MAX_BOT_USERNAME;
+   register the '/' command menu (PATCH /me/commands);
 3. webhook mode: make sure our subscription exists; polling mode: start the poller;
 4. start the outbox worker and the scheduler.
 Without MAX_BOT_TOKEN steps 2–3 and the outbox are skipped: only the website runs.
@@ -100,6 +101,7 @@ async def _start_bot(ctx: AppContext) -> asyncio.Task[None] | None:
         log.warning("bot disabled: MAX_BOT_TOKEN is empty; serving the website only")
         return None
     await _check_identity(ctx)
+    await _register_commands(ctx)
     poller = None
     if config.mode == "webhook":
         await _ensure_webhook(ctx)
@@ -124,6 +126,14 @@ async def _check_identity(ctx: AppContext) -> None:
     configured = ctx.config.max_bot_username
     if me.username and me.username.lower() != configured.lower():
         await ctx.alerts.notify_admins(texts.username_mismatch(actual=me.username, configured=configured))
+
+
+async def _register_commands(ctx: AppContext) -> None:
+    """The '/' menu (§9). Optional: everything is reachable through buttons anyway."""
+    try:
+        await ctx.api.set_commands(texts.COMMAND_MENU)
+    except MaxApiError as error:
+        log.warning("command menu not registered", extra={"error": str(error)})
 
 
 async def _ensure_webhook(ctx: AppContext) -> None:
